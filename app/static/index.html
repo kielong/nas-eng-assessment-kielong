@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VIN Decoder</title>
+  <style>
+    :root {
+      --bg: #f4f1ea;
+      --ink: #1c1917;
+      --muted: #57534e;
+      --card: #fffcf7;
+      --line: #d6d3d1;
+      --accent: #1e3a5f;
+      --accent-hover: #152a45;
+      --good: #166534;
+      --good-bg: #dcfce7;
+      --warn: #92400e;
+      --warn-bg: #fef3c7;
+      --bad: #991b1b;
+      --bad-bg: #fee2e2;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font: 16px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+      color: var(--ink);
+      background: var(--bg);
+    }
+
+    main {
+      max-width: 40rem;
+      margin: 0 auto;
+      padding: 2rem 1.25rem 4rem;
+    }
+
+    h1 {
+      margin: 0 0 0.35rem;
+      font-size: 1.75rem;
+      letter-spacing: -0.02em;
+    }
+
+    .lede {
+      margin: 0 0 1.5rem;
+      color: var(--muted);
+    }
+
+    .lede a { color: var(--accent); }
+
+    label[for="vin"] {
+      display: block;
+      font-size: 0.8rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      margin-bottom: 0.4rem;
+    }
+
+    #vin {
+      width: 100%;
+      font: 1.05rem/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+      letter-spacing: 0.06em;
+      padding: 0.65rem 0.75rem;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+    }
+
+    #vin:focus {
+      outline: 2px solid var(--accent);
+      outline-offset: 1px;
+    }
+
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      margin: 0.85rem 0 1.5rem;
+    }
+
+    button, .link-btn {
+      font: inherit;
+      font-weight: 600;
+      padding: 0.5rem 0.9rem;
+      border-radius: 6px;
+      border: 1px solid transparent;
+      cursor: pointer;
+    }
+
+    button.primary {
+      background: var(--accent);
+      color: #fff;
+    }
+
+    button.primary:hover { background: var(--accent-hover); }
+
+    button.secondary, .link-btn {
+      background: var(--card);
+      color: var(--ink);
+      border-color: var(--line);
+      text-decoration: none;
+    }
+
+    button.secondary:hover, .link-btn:hover { background: #fff; }
+
+    button:disabled { opacity: 0.55; cursor: wait; }
+
+    h2 {
+      margin: 0 0 0.6rem;
+      font-size: 0.8rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    .samples {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.4rem;
+      margin: 0 0 1.75rem;
+      padding: 0;
+      list-style: none;
+    }
+
+    .samples button {
+      font: 0.78rem/1.3 ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-weight: 500;
+      letter-spacing: 0.02em;
+      padding: 0.35rem 0.5rem;
+      background: var(--card);
+      border: 1px solid var(--line);
+      color: var(--ink);
+    }
+
+    .samples button:hover { border-color: var(--accent); color: var(--accent); }
+
+    .panel {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 1rem 1.1rem;
+      min-height: 4rem;
+    }
+
+    .panel[hidden] { display: none; }
+
+    .status {
+      display: inline-block;
+      font-size: 0.8rem;
+      font-weight: 600;
+      padding: 0.15rem 0.5rem;
+      border-radius: 999px;
+      margin-bottom: 0.75rem;
+    }
+
+    .status.cached { background: var(--warn-bg); color: var(--warn); }
+    .status.fresh { background: var(--good-bg); color: var(--good); }
+    .status.deleted { background: var(--good-bg); color: var(--good); }
+    .status.not-deleted { background: var(--warn-bg); color: var(--warn); }
+    .status.error { background: var(--bad-bg); color: var(--bad); }
+    .status.ok { background: var(--good-bg); color: var(--good); }
+
+    dl {
+      display: grid;
+      grid-template-columns: 8.5rem 1fr;
+      gap: 0.35rem 0.75rem;
+      margin: 0;
+    }
+
+    dt {
+      color: var(--muted);
+      font-size: 0.85rem;
+    }
+
+    dd {
+      margin: 0;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      word-break: break-all;
+    }
+
+    .message { margin: 0; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>VIN Decoder</h1>
+    <p class="lede">
+      Looks up a VIN through this app’s cache, then NHTSA vPIC on a miss.
+      Same three routes as <a href="/docs">/docs</a>.
+    </p>
+
+    <label for="vin">VIN</label>
+    <input id="vin" name="vin" maxlength="17" spellcheck="false" autocomplete="off"
+           placeholder="17 alphanumeric characters">
+
+    <div class="actions">
+      <button type="button" class="primary" id="lookup">Lookup</button>
+      <button type="button" class="secondary" id="remove">Remove</button>
+      <button type="button" class="secondary" id="export">Export parquet</button>
+    </div>
+
+    <h2>Sample VINs</h2>
+    <ul class="samples" id="samples"></ul>
+
+    <h2>Result</h2>
+    <div class="panel" id="result" aria-live="polite">
+      <p class="message">Lookup, remove, or export a VIN to see the response here.</p>
+    </div>
+  </main>
+
+  <script>
+    const SAMPLE_VINS = [
+      "1HGCM82633A004352",
+      "5YJ3E1EA6PF384836",
+      "1FTFW1ET9DFC10312",
+      "1C4RJFBG2FC625797",
+      "5FNRL6H79NB021411",
+      "1HD1KBM15FB620271",
+      "1XPWD40X1ED215307",
+    ];
+
+    const vinInput = document.getElementById("vin");
+    const result = document.getElementById("result");
+    const lookupBtn = document.getElementById("lookup");
+    const removeBtn = document.getElementById("remove");
+    const exportBtn = document.getElementById("export");
+
+    document.getElementById("samples").innerHTML = SAMPLE_VINS.map(
+      (vin) => `<li><button type="button" data-vin="${vin}">${vin}</button></li>`
+    ).join("");
+
+    document.getElementById("samples").addEventListener("click", (event) => {
+      const button = event.target.closest("button[data-vin]");
+      if (!button) return;
+      vinInput.value = button.dataset.vin;
+      vinInput.focus();
+    });
+
+    function escapeHtml(value) {
+      return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;");
+    }
+
+    function errorDetail(payload) {
+      if (!payload || payload.detail == null) return "Request failed.";
+      const detail = payload.detail;
+      if (typeof detail === "string") return detail;
+      if (Array.isArray(detail)) {
+        return detail.map((item) => item.msg || JSON.stringify(item)).join("; ");
+      }
+      return JSON.stringify(detail);
+    }
+
+    function showError(status, payload) {
+      result.innerHTML =
+        `<span class="status error">HTTP ${escapeHtml(status)}</span>` +
+        `<p class="message">${escapeHtml(errorDetail(payload))}</p>`;
+    }
+
+    function showLookup(data) {
+      const badge = data.cached
+        ? `<span class="status cached">Cached result</span>`
+        : `<span class="status fresh">Fetched from vPIC</span>`;
+      result.innerHTML = `
+        ${badge}
+        <dl>
+          <dt>vin</dt><dd>${escapeHtml(data.vin)}</dd>
+          <dt>make</dt><dd>${escapeHtml(data.make)}</dd>
+          <dt>model</dt><dd>${escapeHtml(data.model)}</dd>
+          <dt>model_year</dt><dd>${escapeHtml(data.model_year)}</dd>
+          <dt>body_class</dt><dd>${escapeHtml(data.body_class)}</dd>
+        </dl>
+      `;
+    }
+
+    function showRemove(data) {
+      const badge = data.deleted
+        ? `<span class="status deleted">Deleted from cache</span>`
+        : `<span class="status not-deleted">Not in cache</span>`;
+      result.innerHTML = `
+        ${badge}
+        <dl>
+          <dt>vin</dt><dd>${escapeHtml(data.vin)}</dd>
+          <dt>deleted</dt><dd>${escapeHtml(data.deleted)}</dd>
+        </dl>
+      `;
+    }
+
+    async function postJson(path, body) {
+      const response = await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const payload = await response.json().catch(() => null);
+      return { response, payload };
+    }
+
+    async function onLookup() {
+      lookupBtn.disabled = true;
+      try {
+        const { response, payload } = await postJson("/lookup", { vin: vinInput.value });
+        if (!response.ok) {
+          showError(response.status, payload);
+          return;
+        }
+        showLookup(payload);
+      } catch (err) {
+        showError("network", { detail: err.message });
+      } finally {
+        lookupBtn.disabled = false;
+      }
+    }
+
+    async function onRemove() {
+      removeBtn.disabled = true;
+      try {
+        const { response, payload } = await postJson("/remove", { vin: vinInput.value });
+        if (!response.ok) {
+          showError(response.status, payload);
+          return;
+        }
+        showRemove(payload);
+      } catch (err) {
+        showError("network", { detail: err.message });
+      } finally {
+        removeBtn.disabled = false;
+      }
+    }
+
+    async function onExport() {
+      exportBtn.disabled = true;
+      try {
+        const response = await fetch("/export");
+        if (!response.ok) {
+          const payload = await response.json().catch(() => null);
+          showError(response.status, payload);
+          return;
+        }
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = "vin_cache.parquet";
+        link.click();
+        URL.revokeObjectURL(url);
+        result.innerHTML =
+          `<span class="status ok">Downloaded</span>` +
+          `<p class="message">vin_cache.parquet (live cache rows only).</p>`;
+      } catch (err) {
+        showError("network", { detail: err.message });
+      } finally {
+        exportBtn.disabled = false;
+      }
+    }
+
+    lookupBtn.addEventListener("click", onLookup);
+    removeBtn.addEventListener("click", onRemove);
+    exportBtn.addEventListener("click", onExport);
+    vinInput.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") onLookup();
+    });
+  </script>
+</body>
+</html>

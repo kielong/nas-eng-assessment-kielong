@@ -177,18 +177,18 @@ class TestLookup:
         assert vins_in_db(db_path) == set()
 
     @respx.mock
-    def test_missing_vpic_fields_are_stored_as_empty_strings(self, client, db_path):
+    def test_partial_missing_vpic_fields_are_stored_as_empty_strings(self, client, db_path):
         mock_decode(
             SAMPLE_VIN,
-            {"Make": None, "Model": None, "ModelYear": None, "BodyClass": None},
+            {"Make": "HONDA", "Model": "Accord", "ModelYear": "2003", "BodyClass": None},
         )
         response = client.post("/lookup", json={"vin": SAMPLE_VIN})
         assert response.status_code == 200
         assert response.json() == {
             "vin": SAMPLE_VIN,
-            "make": "",
-            "model": "",
-            "model_year": "",
+            "make": "HONDA",
+            "model": "Accord",
+            "model_year": "2003",
             "body_class": "",
             "cached": False,
         }
@@ -198,7 +198,20 @@ class TestLookup:
             (SAMPLE_VIN,),
         ).fetchone()
         conn.close()
-        assert row == ("", "", "", "")
+        assert row == ("HONDA", "Accord", "2003", "")
+
+    @respx.mock
+    def test_all_fields_empty_is_treated_as_undecodable(self, client, db_path):
+        # This is real vPIC behavior for a well-formed-but-garbage VIN: HTTP 200,
+        # Results[0] present, every target field blank. Confirmed against the
+        # live API (AAAAAAAAAAAAAAAAA) rather than assumed.
+        mock_decode(
+            SAMPLE_VIN,
+            {"Make": None, "Model": None, "ModelYear": None, "BodyClass": None},
+        )
+        response = client.post("/lookup", json={"vin": SAMPLE_VIN})
+        assert response.status_code == 502
+        assert vins_in_db(db_path) == set()
 
 
 class TestRemove:
@@ -268,6 +281,16 @@ class TestDemoUi:
         assert "text/html" in response.headers["content-type"]
         assert "1HGCM82633A004352" in response.text
         assert "5YJ3E1EA6PF384836" in response.text
+
+
+class TestSqliteConcurrencySettings:
+    def test_wal_mode_and_busy_timeout_are_set_on_connect(self, client, db_path):
+        conn = sqlite3.connect(db_path)
+        journal_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        busy_timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        conn.close()
+        assert journal_mode.lower() == "wal"
+        assert busy_timeout == 5000
 
 
 class TestTtlPredicate:

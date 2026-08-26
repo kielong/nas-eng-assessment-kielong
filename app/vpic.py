@@ -38,9 +38,15 @@ async def decode_vin(client: httpx.AsyncClient, base_url: str, vin: str) -> Deco
         raise VpicError("vPIC returned no decode results")
 
     row = results[0]
-    return DecodedVehicle(
+    decoded = DecodedVehicle(
         make=_field(row, "Make"),
         model=_field(row, "Model"),
         model_year=_field(row, "ModelYear"),
         body_class=_field(row, "BodyClass"),
     )
+    if not any((decoded.make, decoded.model, decoded.model_year, decoded.body_class)):
+        # vPIC returns HTTP 200 with Results[0] even for a well-formed but
+        # undecodable VIN; all four fields blank is that case, confirmed
+        # against the live API rather than vPIC's own ErrorCode taxonomy.
+        raise VpicError("vPIC could not decode this VIN")
+    return decoded

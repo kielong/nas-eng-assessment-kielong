@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from sqlalchemy import Select, Text, select
+from sqlalchemy import Select, Text, event, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -31,6 +31,17 @@ def database_url(path: str) -> str:
 
 def create_engine_and_sessionmaker(path: str):
     engine = create_async_engine(database_url(path))
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _set_sqlite_pragmas(dbapi_connection, connection_record) -> None:
+        # Default rollback-journal SQLite raises "database is locked" under
+        # concurrent writers even within one process (e.g. two overlapping
+        # requests). WAL + a busy timeout make that a wait, not an error.
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=5000")
+        cursor.close()
+
     session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
     return engine, session_factory
 

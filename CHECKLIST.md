@@ -1,6 +1,6 @@
 # Implementation checklist
 
-This file is the execution record for the VIN decoder. The original problem is in [ASSIGNMENT.md](ASSIGNMENT.md). The design we locked before writing code is in [`.cursor/plans/vin_decoder_design.plan.md`](.cursor/plans/vin_decoder_design.plan.md). Tradeoffs after the fact live in [NOTES.md](NOTES.md).
+This file is the execution record for the VIN decoder: what was built, in what order, and when each piece was marked done. The design decisions themselves — including the alternatives considered and why each one lost — live in [`.cursor/plans/vin_decoder_design.plan.md`](.cursor/plans/vin_decoder_design.plan.md). The original problem is in [ASSIGNMENT.md](ASSIGNMENT.md). Interview-facing tradeoffs and the production discussion live in [NOTES.md](NOTES.md).
 
 We used AI as a coding assistant, not as the source of the design. Order of work:
 
@@ -38,7 +38,7 @@ Expired-then-vPIC-fails: we delete the stale row first, then call vPIC. A 502 le
 
 **Goal.** Empty app that can be installed on another machine. No business logic yet.
 
-**Context.** FastAPI is required. Layout stays flat so every file can be walked through in a review. Dependencies live in `requirements.txt` (runtime) and `requirements-dev.txt` (tests) so a PyCharm or clean-checkout venv is not empty until someone runs `pip install -e ".[dev]"` against `pyproject.toml` only.
+**Context.** FastAPI is required. Layout stays flat so every file can be walked through in a review. Dependencies live in `requirements.txt` (runtime) and `requirements-dev.txt` (tests); a clean-checkout venv only needs `pip install -r requirements.txt` (plus `-r requirements-dev.txt` for tests) — no editable install of the local `app` package is documented or required to run the app. That gap is exactly what made bare `pytest` fail before Phase 7 fixed it (see below).
 
 **Do**
 
@@ -153,12 +153,13 @@ Expired-then-vPIC-fails: we delete the stale row first, then call vPIC. A 502 le
 
 ## Phase 7 — Hardening (self-review pass)
 
-**Goal.** Phases 1–6 were built on Cursor as the original submission. This phase is a second pass — reviewing that implementation against the assignment and fixing what it missed — done with Claude. It closes two correctness/robustness gaps found in `/lookup` and the SQLite layer. It does not add scope: no new routes, columns, or dependencies, and no production/multi-replica concerns (those are deliberately deferred — see NOTES.md, "If this had to handle real traffic").
+**Goal.** Phases 1–6 were built on Cursor as the original submission. This phase is a second pass — reviewing that implementation against the assignment and fixing what it missed — done with Claude. It closes three correctness/robustness gaps found in `/lookup`, the SQLite layer, and the test-packaging setup. It does not add scope: no new routes, columns, or dependencies, and no production/multi-replica concerns (those are deliberately deferred — see NOTES.md, "If this had to handle real traffic").
 
-**Context.** Two gaps were in scope because they affect the app *as delivered*, not just at hypothetical future scale:
+**Context.** Three gaps were in scope because they affect the app *as delivered*, not just at hypothetical future scale:
 
 1. vPIC returns HTTP 200 with `Results[0]` present even for a well-formed but undecodable VIN — confirmed against the live API (`AAAAAAAAAAAAAAAAA` → 200, `Make`/`Model`/`ModelYear`/`BodyClass` all blank, `ErrorCode: "1,7,400"`). The original implementation had no way to tell that apart from a real decode, so a garbage VIN would cache as a false "hit" with empty fields forever (until TTL).
 2. SQLite's default rollback-journal mode raises `database is locked` under concurrent writers even within a single process — e.g. two overlapping requests from the demo page. Nothing in the original implementation configured around this.
+3. Bare `pytest` (the command the README documents) failed with `ModuleNotFoundError: No module named 'app'` on a genuinely clean, isolated venv. `pyproject.toml` declares `app` as an installable package, but nothing in the documented setup (`pip install -r requirements.txt` / `requirements-dev.txt`) installs it that way, and pytest's own import machinery only puts `tests/` on `sys.path`, not the repo root. Reproduced by hand in an isolated venv before fixing, to confirm the real cause rather than guessing.
 
 A per-VIN request lock (to collapse concurrent duplicate vPIC calls) and vPIC's own `ErrorCode` taxonomy were both considered and deliberately **not** implemented here — the former is a production-scale concern with its own tradeoff (unbounded lock-table growth), and the latter is a semi-documented, comma-separated field I could not fully verify. Both are named explicitly in NOTES.md rather than guessed at in code.
 
@@ -166,6 +167,7 @@ A per-VIN request lock (to collapse concurrent duplicate vPIC calls) and vPIC's 
 
 - [x] `decode_vin` treats a decode where all four fields (`make`, `model`, `model_year`, `body_class`) come back empty as `VpicError` — 502, nothing written to the cache
 - [x] SQLite connections set `PRAGMA journal_mode=WAL` and `PRAGMA busy_timeout=5000` on connect
+- [x] `pyproject.toml`: `pythonpath = ["."]` under `[tool.pytest.ini_options]`, so bare `pytest` resolves `app` without requiring an editable install
 - [x] `.idea/` untracked and gitignored
 
 **Tests added**
@@ -174,4 +176,6 @@ A per-VIN request lock (to collapse concurrent duplicate vPIC calls) and vPIC's 
 - [x] All four vPIC fields empty → 502, nothing written to SQLite
 - [x] A fresh SQLite connection reports `journal_mode=wal` and `busy_timeout=5000`
 
-**Done when.** `pytest` is still green offline, and both fixes are demonstrable without any new routes, columns, or dependencies.
+**Verified manually.** The `pythonpath` fix was confirmed by reproducing `ModuleNotFoundError` in a properly isolated fresh venv (`pip install -r requirements-dev.txt` only, no editable install), then re-running `pytest` against that same venv after the fix.
+
+**Done when.** `pytest` is still green offline — including a bare `pytest` invocation with no editable install — and all three fixes are demonstrable without any new routes, columns, or dependencies.

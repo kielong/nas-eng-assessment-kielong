@@ -38,7 +38,7 @@ Snake_case JSON (not the README's display labels). Same names as the table, so t
 Request:
 
 ```json
-
+{"vin": "1HGCM82633A004352"}
 ```
 
 Response:

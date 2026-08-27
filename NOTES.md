@@ -44,11 +44,11 @@ I'd run one container, one uvicorn worker, SQLite on a volume. There is no Docke
 
 ### If this had to handle real traffic
 
-In rough priority order:
+In rough priority order, sorted by throughput bottleneck, not by risk exposure — under a risk framing, auth (#6) would move much higher, since it's a cost/abuse risk at any traffic level, not just at scale:
 
 1. **Move the cache to Postgres.** A SQLite file pins the app to a single writer/instance; Postgres unblocks horizontal scaling.
 2. **Collapse concurrent misses.** A per-VIN single-flight — an in-process `asyncio.Lock`, or a Postgres advisory lock across replicas — so N simultaneous first-lookups of the same VIN produce one vPIC call, not N.
-3. **Retry with backoff + a circuit breaker around vPIC.** One slow or down NHTSA response shouldn't cascade to every idle request.
+3. **Retry with backoff + a circuit breaker around vPIC.** Each `/lookup` is its own coroutine, so one slow response doesn't block others directly — but a burst of concurrently slow or down vPIC responses exhausts httpx's connection pool, backing up every new vPIC call behind it.
 4. **Stream `/export`.** It currently loads every live row into memory before responding — fine at demo scale, not once the cache is large.
-5. **Structured logging + a cache-hit-ratio metric.** No way today to observe whether the cache is doing its job.
+5. **Structured logging + a cache-hit-ratio metric.** The maintenance sweep already logs purge/evict counts, but there's no per-request hit/miss visibility and nothing you could graph — that's the real gap.
 6. **Auth or rate limiting in front of `/lookup`.** As it stands this is a free, unauthenticated proxy to a third-party API.

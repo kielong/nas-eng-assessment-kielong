@@ -113,6 +113,18 @@ class TestValidation:
         response = client.post("/remove", json={"vin": "1HGCM82633A00435!"})
         assert response.status_code == 422
 
+    def test_rejects_missing_vin_key(self, client):
+        response = client.post("/lookup", json={})
+        assert response.status_code == 422
+
+    def test_rejects_null_vin(self, client):
+        response = client.post("/lookup", json={"vin": None})
+        assert response.status_code == 422
+
+    def test_rejects_non_string_vin(self, client):
+        response = client.post("/remove", json={"vin": 11111111111111111})
+        assert response.status_code == 422
+
 
 class TestLookup:
     @respx.mock
@@ -292,6 +304,31 @@ class TestExport:
         assert table.column("vin").to_pylist() == []
         assert vins_in_db(db_path) == set()
 
+    @respx.mock
+    def test_export_does_not_enforce_the_row_cap(self, db_path, monkeypatch):
+        # /export only calls db.purge_expired, never db.enforce_size_cap --
+        # only the periodic background sweep enforces CACHE_MAX_ROWS. This
+        # proves that's still true: with a cap of 2, three live lookups
+        # should all still show up in an export taken before the next tick
+        # (sweep interval set far longer than this test can run).
+        monkeypatch.setenv("DATABASE_PATH", str(db_path))
+        monkeypatch.setenv("CACHE_TTL_SECONDS", str(TTL_SECONDS))
+        monkeypatch.setenv("CACHE_MAX_ROWS", "2")
+        monkeypatch.setenv("CACHE_SWEEP_INTERVAL_SECONDS", "3600")
+
+        vins = [SAMPLE_VIN, OTHER_VIN, "1FTFW1ET9DFC10312"]
+        for vin in vins:
+            mock_decode(vin, HONDA)
+
+        application = create_app()
+        with TestClient(application) as test_client:
+            for vin in vins:
+                test_client.post("/lookup", json={"vin": vin})
+
+            response = test_client.get("/export")
+            table = pq.read_table(io.BytesIO(response.content))
+            assert set(table.column("vin").to_pylist()) == set(vins)
+
 
 class TestExportFilename:
     def test_exact_format_for_a_known_timestamp(self):
@@ -379,6 +416,38 @@ class TestSizeCap:
 
         await engine.dispose()
         assert evicted == 0
+
+    @pytest.mark.asyncio
+    async def test_enforce_size_cap_is_a_noop_exactly_at_the_cap(self, tmp_path):
+        # The other two tests are 3 rows/cap 2 (clearly over) and 1 row/cap
+        # 10 (clearly under) -- neither would catch an off-by-one in
+        # `overflow <= 0`. Count == cap exactly is the case that would.
+        engine, session_factory = create_engine_and_sessionmaker(str(tmp_path / "cache.db"))
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        base = datetime(2026, 8, 26, 12, 0, 0, tzinfo=timezone.utc)
+        vins = ["1HGCM82633A004352", "5YJ3E1EA6PF384836"]
+        async with session_factory() as session:
+            for i, vin in enumerate(vins):
+                session.add(
+                    VinCache(
+                        vin=vin,
+                        make="HONDA",
+                        model="Accord",
+                        model_year="2003",
+                        body_class="Sedan/Saloon",
+                        cached_at=(base + timedelta(minutes=i)).isoformat(),
+                    )
+                )
+            await session.commit()
+
+            evicted = await enforce_size_cap(session, max_rows=len(vins))
+            rows = await list_all(session)
+
+        await engine.dispose()
+        assert evicted == 0
+        assert {row.vin for row in rows} == set(vins)
 
 
 class TestBackgroundMaintenance:

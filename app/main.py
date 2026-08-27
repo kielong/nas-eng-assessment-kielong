@@ -62,6 +62,10 @@ def create_app() -> FastAPI:
         try:
             yield
         finally:
+            # CancelledError isn't an Exception subclass, so the loop's own
+            # `except Exception` doesn't swallow it -- cancel() here always
+            # produces a real CancelledError on the await below, expected
+            # and discarded, not a sign the loop failed.
             maintenance_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await maintenance_task

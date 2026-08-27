@@ -31,6 +31,8 @@ async def decode_vin(client: httpx.AsyncClient, base_url: str, vin: str) -> Deco
     except httpx.HTTPError as exc:
         raise VpicError("vPIC request failed") from exc
     except ValueError as exc:
+        # response.json() raises json.JSONDecodeError (a ValueError subclass)
+        # on malformed JSON -- not an httpx.HTTPError, so it needs its own clause.
         raise VpicError("vPIC returned invalid JSON") from exc
 
     results = payload.get("Results") if isinstance(payload, dict) else None

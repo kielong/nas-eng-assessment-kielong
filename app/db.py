@@ -55,6 +55,9 @@ def create_engine_and_sessionmaker(
         cursor.execute("PRAGMA busy_timeout=5000")
         cursor.close()
 
+    # expire_on_commit=False: the default (True) would force a fresh SELECT
+    # the next time a committed row's attributes are read -- e.g. _lookup_response
+    # reading row.make after upsert() has already committed and refreshed it.
     session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
     return engine, session_factory
 
@@ -62,6 +65,10 @@ def create_engine_and_sessionmaker(
 def _parse_cached_at(value: str) -> datetime:
     cached_at = datetime.fromisoformat(value)
     if cached_at.tzinfo is None:
+        # This module always writes an aware UTC timestamp (utcnow_iso), so a
+        # naive one here would only come from a hand-edited row -- treat it
+        # as UTC rather than raise, so a manual DB edit degrades to "wrong
+        # TTL," not a crash on the next lookup.
         cached_at = cached_at.replace(tzinfo=timezone.utc)
     return cached_at
 
@@ -101,7 +108,7 @@ async def upsert(
         body_class=body_class,
         cached_at=utcnow_iso(),
     )
-    row = await session.merge(row)
+    row = await session.merge(row)  # INSERT if new, UPDATE if this VIN already has a row
     await session.commit()
     await session.refresh(row)
     return row

@@ -15,6 +15,9 @@ from app.settings import Settings
 
 router = APIRouter()
 
+# Passed explicitly to pa.Table.from_pylist below rather than inferred: an
+# empty list with no schema produces a zero-column table, which would break
+# an export of an empty cache (it must still have these five typed columns).
 EXPORT_SCHEMA = pa.schema(
     [
         ("vin", pa.string()),
@@ -101,6 +104,10 @@ async def export_cache(
     session: AsyncSession = Depends(get_session),
     settings: Settings = Depends(get_app_settings),
 ) -> Response:
+    # Purges expired rows, but deliberately does not enforce CACHE_MAX_ROWS --
+    # that's the periodic background sweep's job (app/main.py). An export can
+    # therefore show more rows than the cap between sweep ticks; see
+    # NOTES.md's tradeoffs table ("cap and TTL enforced on a timer").
     await db.purge_expired(session, settings.cache_ttl_seconds)
     rows = await db.list_all(session)
     table = pa.Table.from_pylist(

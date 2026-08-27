@@ -14,6 +14,16 @@ from app.settings import Settings
 
 router = APIRouter()
 
+EXPORT_SCHEMA = pa.schema(
+    [
+        ("vin", pa.string()),
+        ("make", pa.string()),
+        ("model", pa.string()),
+        ("model_year", pa.string()),
+        ("body_class", pa.string()),
+    ]
+)
+
 
 async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
     async with request.app.state.session_factory() as session:
@@ -82,14 +92,18 @@ async def export_cache(
 ) -> Response:
     await db.purge_expired(session, settings.cache_ttl_seconds)
     rows = await db.list_all(session)
-    table = pa.table(
-        {
-            "vin": pa.array([row.vin for row in rows], type=pa.string()),
-            "make": pa.array([row.make for row in rows], type=pa.string()),
-            "model": pa.array([row.model for row in rows], type=pa.string()),
-            "model_year": pa.array([row.model_year for row in rows], type=pa.string()),
-            "body_class": pa.array([row.body_class for row in rows], type=pa.string()),
-        }
+    table = pa.Table.from_pylist(
+        [
+            {
+                "vin": row.vin,
+                "make": row.make,
+                "model": row.model,
+                "model_year": row.model_year,
+                "body_class": row.body_class,
+            }
+            for row in rows
+        ],
+        schema=EXPORT_SCHEMA,
     )
     buf = io.BytesIO()
     pq.write_table(table, buf)

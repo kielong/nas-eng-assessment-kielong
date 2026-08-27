@@ -48,8 +48,9 @@ Expired-then-vPIC-fails: we delete the stale row first, then call vPIC. A 502 le
 - [x] `pyproject.toml` (Python 3.11+, FastAPI, uvicorn, httpx, SQLAlchemy asyncio, aiosqlite, pyarrow)
 - [x] `requirements.txt` / `requirements-dev.txt` with pinned versions
 - [x] `.gitignore` for `.venv`, `__pycache__`, `data/*.db`
+- [x] `get_settings()` rejects a zero or negative `CACHE_TTL_SECONDS` / `CACHE_SWEEP_INTERVAL_SECONDS` / `CACHE_MAX_ROWS` / `VPIC_TIMEOUT_SECONDS` at startup, not just non-numeric garbage — a `0` sweep interval would otherwise busy-loop the background task against the DB instead of failing loudly
 
-**Done when.** `pip install -r requirements.txt` in a fresh venv installs enough to import the package. DB file is not in git.
+**Done when.** `pip install -r requirements.txt` in a fresh venv installs enough to import the package. DB file is not in git. A misconfigured env var (non-numeric, zero, or negative) fails at startup with a clear message, not a silent misbehavior.
 
 ---
 
@@ -61,17 +62,18 @@ Expired-then-vPIC-fails: we delete the stale row first, then call vPIC. A 502 le
 
 **Do**
 
-- [x] Model `vin_cache`: `vin` PK, `make`, `model`, `model_year`, `body_class`, `cached_at` (UTC ISO-8601 text)
+- [x] Model `vin_cache`: `vin` PK, `make`, `model`, `model_year`, `body_class`, `cached_at` (UTC ISO-8601 text, indexed — both maintenance functions filter/sort by it on every sweep)
 - [x] Empty vPIC fields stored as `""`, not NULL
-- [x] `get_live`: missing or age ≥ TTL → delete row, return miss
+- [x] `get_live`: missing or age ≥ TTL → delete row, return miss (commented in code: a "get" with a write side effect is exactly the non-obvious behavior worth a line)
 - [x] `upsert` with a new `cached_at`
 - [x] `delete_vin` (true if a row existed, expired or not)
-- [x] `purge_expired` then `list_all` for export; returns the count it removed
+- [x] `purge_expired`: single `DELETE ... WHERE cached_at <= cutoff`, not a fetch-all-then-filter-then-delete-per-row loop — brought in line with `enforce_size_cap`'s existing bulk-delete pattern, since both rely on the same fact (`cached_at` is always this module's own consistently-formatted ISO-8601 string, so it compares correctly in SQL); returns the count it removed
 - [x] `enforce_size_cap`: once the table exceeds `CACHE_MAX_ROWS`, evict the oldest rows by `cached_at` down to the cap
+- [x] `create_engine_and_sessionmaker` has an explicit return type (`tuple[AsyncEngine, async_sessionmaker[AsyncSession]]`) — was the one function in the file without one
 - [x] `decode_vin`: DecodeVinValues, no `modelyear` query param, ~10s timeout
 - [x] `VpicError` on non-200, timeout, invalid JSON, or empty `Results`
 
-**Done when.** A row can be written, read as live, treated as expired, and deleted. A decode maps four fields and fails closed. The table never holds more than `CACHE_MAX_ROWS` rows once maintenance has run.
+**Done when.** A row can be written, read as live, treated as expired, and deleted. A decode maps four fields and fails closed. The table never holds more than `CACHE_MAX_ROWS` rows once maintenance has run. `purge_expired` and `enforce_size_cap` both run as a single SQL statement, not a fetch-then-loop, so they scale the same way at 100,000 rows as at 10.
 
 ---
 
@@ -87,6 +89,7 @@ Expired-then-vPIC-fails: we delete the stale row first, then call vPIC. A 502 le
 - [x] `POST /remove` → `{ "vin", "deleted" }`, HTTP 200 either way
 - [x] `GET /export` → purge expired, parquet attachment `vin_cache.parquet` (`application/vnd.apache.parquet`)
 - [x] Empty / all-expired export is a valid empty table with the five string columns
+- [x] `/export`'s parquet table is built with a fixed `EXPORT_SCHEMA` and a single pass over the rows (`pa.Table.from_pylist`), not five separate column comprehensions over the same list
 - [x] App lifespan starts `_cache_maintenance_loop` (purge expired + enforce row cap) alongside the DB engine and httpx client, cancelled cleanly on shutdown; sweep failures are logged and retried next interval, never surfaced to a request
 
 **Done when.** Lookup miss then hit does not call vPIC twice. Export does not include `cached` or `cached_at`. Invalid VIN is 422.
@@ -97,7 +100,7 @@ Expired-then-vPIC-fails: we delete the stale row first, then call vPIC. A 502 le
 
 **Goal.** Prove the locked behavior without hitting NHTSA.
 
-**Context.** `respx` mocks DecodeVinValues. Each test gets a temp SQLite file. Assignment sample VINs are used where a real-looking value helps.
+**Context.** `respx` mocks DecodeVinValues. Each test gets a temp SQLite file. Assignment sample VINs are used where a real-looking value helps. `tests/test_api.py` is the HTTP-level suite (through `TestClient`, full app wiring); `tests/test_vpic.py` and `tests/test_settings.py` unit-test those two modules directly, in isolation from the DB and HTTP layers — added after a code-quality pass found they were only ever exercised *indirectly*, through `/lookup` and the `client` fixture's incidental env vars, never verified on their own.
 
 **Do**
 
@@ -112,6 +115,9 @@ Expired-then-vPIC-fails: we delete the stale row first, then call vPIC. A 502 le
 - [x] Export includes live rows and drops expired ones from the file and the DB
 - [x] `enforce_size_cap` evicts the oldest rows by `cached_at` once over `CACHE_MAX_ROWS`, and is a no-op under it
 - [x] The background maintenance task purges an expired row and evicts over the cap on its own — seeded before startup, no `/lookup` or `/export` call, polled after the app starts
+- [x] `tests/test_vpic.py`: `decode_vin`/`_field` tested directly against a mocked `httpx.AsyncClient` — every `VpicError` branch (HTTP error, timeout, invalid JSON, missing/empty/non-list `Results`, non-dict first result, all-fields-empty), plus the exact request shape (`format=json`, no `modelyear` param) and that a *partially* populated decode is still a success
+- [x] `tests/test_settings.py`: `get_settings()` defaults when nothing is set, every one of the 6 env vars overrides its field, and the new positive-value validation rejects `0` / negative / non-numeric input for each numeric setting
+- [x] Stray `import io` inside two test functions moved to the top-level import, matching every other import in the file
 
 **Done when.** `pytest` is green offline.
 
@@ -203,6 +209,8 @@ Design lives in `.cursor/plans/vin_decoder_design.plan.md`, "Demo script: concur
 - [x] Friendly, non-crashing output if the server isn't reachable (checked up front, exits with the start-server command) or if a request fails mid-run (caught around both demos, prints a hint instead of a traceback)
 
 **Found and fixed during manual testing:** an early version declared eviction "done" as soon as the row count first dropped below 7. Live testing against a real server (`uvicorn`, `CACHE_MAX_ROWS=3`, `CACHE_SWEEP_INTERVAL_SECONDS=5`) showed why that's wrong — a sweep tick firing *while* the 7 lookups are still landing can evict early, then more rows land afterward, settling on a count that's lower but not yet converged to the real cap (observed: 5 rows instead of 3). Fixed by always waiting a fixed window (`2 × sweep interval + 5s`) *after* the last write finishes, guaranteeing at least one clean tick sees the fully-settled row set, rather than trusting the first observed decrease. Re-verified twice against a live server afterward: both runs converged correctly (4 evicted, the 3 most-recently-looked-up VINs survived).
+
+**Found and fixed during a later code-quality pass:** `check_server_reachable` only caught `httpx.ConnectError`. `httpx.ConnectTimeout` is a sibling, not a subclass, of `ConnectError` — confirmed with `issubclass()` against the actual installed httpx version rather than assumed — so a server that's listening but hung would fall through this check and crash with a raw traceback instead of the friendly "start the server with..." message, defeating the point of the script. Fixed by catching `httpx.TransportError` instead, the common parent of both. Same verification approach: checked the real class hierarchy before and after the fix, not just re-read the code.
 
 **Out of scope for this phase.** No new pytest test — this is a narrated demo for a human, not a CI regression check; the underlying behaviors already have their own tests from Phases 2/3/4/7. No change to `CACHE_MAX_ROWS`'s production default. No in-process server startup by the script itself (see plan.md, option A vs B).
 

@@ -72,7 +72,11 @@ def banner(title: str) -> None:
 async def check_server_reachable(client: httpx.AsyncClient) -> None:
     try:
         await client.get("/", timeout=5.0)
-    except httpx.ConnectError:
+    except httpx.TransportError:
+        # Covers both "nothing is listening" (ConnectError) and "something is
+        # listening but not responding" (ConnectTimeout) -- siblings in
+        # httpx's exception tree, not parent/child, so ConnectError alone
+        # would miss a hung server and fall through to a raw traceback.
         print(f"Could not reach {BASE_URL}.")
         print()
         print("Start the server first -- with a small cache cap so the size-cap")

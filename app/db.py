@@ -2,7 +2,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from sqlalchemy import Select, Text, delete, event, func, select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -18,18 +23,26 @@ class VinCache(Base):
     model: Mapped[str] = mapped_column(Text, nullable=False)
     model_year: Mapped[str] = mapped_column(Text, nullable=False)
     body_class: Mapped[str] = mapped_column(Text, nullable=False)
-    cached_at: Mapped[str] = mapped_column(Text, nullable=False)
+    # Indexed: purge_expired and enforce_size_cap both filter/sort by this on
+    # every maintenance sweep, and it's the only non-PK column either queries.
+    cached_at: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+
+
+def _format_iso(value: datetime) -> str:
+    return value.replace(microsecond=0).isoformat()
 
 
 def utcnow_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    return _format_iso(datetime.now(timezone.utc))
 
 
 def database_url(path: str) -> str:
     return f"sqlite+aiosqlite:///{Path(path).resolve()}"
 
 
-def create_engine_and_sessionmaker(path: str):
+def create_engine_and_sessionmaker(
+    path: str,
+) -> tuple[AsyncEngine, async_sessionmaker[AsyncSession]]:
     engine = create_async_engine(database_url(path))
 
     @event.listens_for(engine.sync_engine, "connect")
@@ -63,6 +76,8 @@ async def get_live(session: AsyncSession, vin: str, ttl_seconds: int) -> VinCach
     if row is None:
         return None
     if is_expired(row.cached_at, ttl_seconds):
+        # Side effect despite the name: an expired row is deleted here, not
+        # just ignored, so a miss always means "safe to write a fresh row."
         await session.delete(row)
         await session.commit()
         return None
@@ -105,12 +120,16 @@ async def purge_expired(
     session: AsyncSession, ttl_seconds: int, now: datetime | None = None
 ) -> int:
     now = now or datetime.now(timezone.utc)
-    rows = await list_all(session)
-    expired = [row for row in rows if is_expired(row.cached_at, ttl_seconds, now=now)]
-    for row in expired:
-        await session.delete(row)
+    cutoff = _format_iso(now - timedelta(seconds=ttl_seconds))
+    # cached_at is always this module's own aware, UTC, second-precision
+    # ISO-8601 output (utcnow_iso/_format_iso), which sorts and compares
+    # correctly as a plain string -- enforce_size_cap already relies on the
+    # same property for its ORDER BY. That lets this run as one DELETE
+    # instead of fetching every row into Python to filter and delete
+    # one at a time, which matters once the table is at production scale.
+    result = await session.execute(delete(VinCache).where(VinCache.cached_at <= cutoff))
     await session.commit()
-    return len(expired)
+    return result.rowcount or 0
 
 
 async def enforce_size_cap(session: AsyncSession, max_rows: int) -> int:

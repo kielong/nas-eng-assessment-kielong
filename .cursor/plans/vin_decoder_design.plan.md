@@ -117,9 +117,12 @@ CREATE TABLE vin_cache (
   body_class  TEXT NOT NULL,
   cached_at   TEXT NOT NULL
 );
+CREATE INDEX ix_vin_cache_cached_at ON vin_cache (cached_at);
 ```
 
-`cached_at` is UTC ISO-8601. Missing vPIC values are stored as `""`, not NULL, so parquet and JSON stay uniform.
+`cached_at` is UTC ISO-8601, always produced by this module's own `utcnow_iso`/`_format_iso` (same precision, same `+00:00` offset every time), which is what lets `purge_expired` and `enforce_size_cap` both compare/sort it as a plain string in SQL rather than parsing every row back into a `datetime` in Python. It's indexed because both maintenance functions filter or sort by it on every sweep tick — the only non-PK column either one queries.
+
+Missing vPIC values are stored as `""`, not NULL, so parquet and JSON stay uniform.
 
 | Option | Tradeoff |
 |---|---|
@@ -141,7 +144,7 @@ CREATE TABLE vin_cache (
 
 **Why B.** VIN attributes are static in practice, so "freshness" isn't the goal — bounding staleness and absolute size is. An in-process periodic task gets both without paying for a scheduler: still zero new infrastructure, just no longer purely reactive. `/lookup` and `/remove` still clean up their own VIN reactively as before; the sweep is what catches everything else — a VIN looked up once and never revisited, or a burst of distinct-VIN traffic within one TTL window that would otherwise grow the table unbounded. C's benefit (enforcement independent of the app process) isn't worth its cost (a new deployable) at this scale; D solves a staleness problem that doesn't really exist here.
 
-Implementation: `app/db.py` adds `enforce_size_cap` (evicts the oldest rows by `cached_at` once the table exceeds `CACHE_MAX_ROWS`, default `10000`) alongside the existing `purge_expired`. `app/main.py`'s lifespan starts a single background task, `_cache_maintenance_loop`, that calls both once immediately at startup and then every `CACHE_SWEEP_INTERVAL_SECONDS`, cancelled cleanly on shutdown. Sweep failures are logged and retried next interval rather than crashing the loop or surfacing as a request-facing error.
+Implementation: `app/db.py` adds `enforce_size_cap` (evicts the oldest rows by `cached_at` once the table exceeds `CACHE_MAX_ROWS`, default `10000`) alongside `purge_expired`. Both now run as a single SQL `DELETE ... WHERE ...` — `purge_expired` originally fetched every row into Python as ORM objects and filtered/deleted one at a time, which a later code-quality pass flagged as both an efficiency gap (full table materialization on every hourly tick) and a consistency gap against `enforce_size_cap`'s already-bulk pattern; rewritten to match. `app/main.py`'s lifespan starts a single background task, `_cache_maintenance_loop`, that calls both once immediately at startup and then every `CACHE_SWEEP_INTERVAL_SECONDS`, cancelled cleanly on shutdown. Sweep failures are logged and retried next interval rather than crashing the loop or surfacing as a request-facing error.
 
 ```mermaid
 flowchart TD
@@ -239,7 +242,9 @@ flowchart TD
 
 **Why B**, with a mitigation: the Phase 7 "all fields empty" rule (see "vPIC client") wasn't guessed — it was verified by hitting the live API by hand for both a real sample VIN and a garbage one, once, before writing the mocked test around that confirmed shape. The mocks encode a contract that was checked against the real thing, not assumed.
 
-24 tests across `tests/test_api.py`: request validation, lookup miss/hit/expiry, vPIC failure modes (HTTP error, timeout, invalid JSON, empty `Results`, all-fields-empty), remove hit/miss, export (empty, mixed live/expired, exact-TTL boundary), the demo page, the SQLite WAL/busy-timeout pragmas, size-cap eviction (unit-level), and one integration test proving the background sweep purges an expired row and evicts over the row cap on its own, with no `/lookup` or `/export` call — seeded directly into the SQLite file before the app starts, polled for up to 2 seconds after startup.
+50 tests across three files, not one. `tests/test_api.py` (24) is the HTTP-level suite through `TestClient` — request validation, lookup miss/hit/expiry, vPIC failure modes surfaced as 502s, remove hit/miss, export (empty, mixed live/expired, exact-TTL boundary), the demo page, the SQLite WAL/busy-timeout pragmas, size-cap eviction, and one integration test proving the background sweep purges an expired row and evicts over the row cap on its own with no `/lookup`/`/export` call, seeded before the app starts and polled after.
+
+`tests/test_vpic.py` (15) and `tests/test_settings.py` (11) are dedicated unit tests, added by a later code-quality pass. Both modules were only ever exercised *indirectly* before that — `decode_vin` through `/lookup` + `respx` mocking (which does run its real code, just by way of the full FastAPI+DB stack), and `get_settings()` incidentally, through whichever two of its six env vars a given HTTP-level test's fixture happened to set. That's not "untested," but it means an edge case in either module — `Results[0]` present but not a dict, a `CACHE_MAX_ROWS` of zero — could only be reached by routing through code that has nothing to do with it. The rule that emerged: a module gets its own direct unit-test file when it has real branching logic worth isolating (`vpic.py`'s error-mapping, `settings.py`'s validation); a thin pass-through (`schemas.py`'s validator, `routes.py`'s dependency getters) stays covered adequately through the HTTP-level tests that already exercise it. This is the answer to "should every component have its own unit tests" for this project: not uniformly, but wherever a module's own logic is complex enough that indirect coverage would hide failures rather than catch them.
 
 ## Packaging & tooling
 
@@ -292,6 +297,8 @@ The script sequentially looks up all 7 of the assignment's sample VINs, spaced 1
 
 That fixed-window wait replaced an earlier "declare success as soon as the row count first drops" approach, which manual testing against a live server showed was wrong: a sweep tick firing *while* the 7 lookups are still landing can evict early, then more rows land afterward, settling on a count that's lower but not fully converged to the cap (observed: 5 rows left instead of 3, because the tick fired mid-loop). Waiting a window that comfortably covers a full sweep interval *after* the last write finishes guarantees the final read reflects a clean tick over the fully-settled row set. If the count never drops at all within that window, it prints a hint pointing back at the required env vars rather than failing silently.
 
+A second bug surfaced during a later code-quality pass: `check_server_reachable` only caught `httpx.ConnectError`, but `httpx.ConnectTimeout` is a sibling exception, not a subclass — confirmed with `issubclass()` against the installed httpx version, not assumed — so a server that's listening but hung would crash the script with a raw traceback instead of the friendly message it exists to show. Fixed by catching `httpx.TransportError`, the common parent of both.
+
 **How to run it:**
 
 ```bash
@@ -308,10 +315,12 @@ No new dependency — `httpx` and `pyarrow` are already in `pyproject.toml`/`req
 - [`app/static/index.html`](../../app/static/index.html) — demo page (lookup / remove / export)
 - [`app/schemas.py`](../../app/schemas.py) — `VinRequest`, `LookupResponse`, `RemoveResponse`
 - [`app/routes.py`](../../app/routes.py) — three endpoints
-- [`app/db.py`](../../app/db.py) — engine (WAL + busy-timeout pragmas on connect), `VinCache`, get/upsert/delete/purge-expired/enforce-size-cap/list
+- [`app/db.py`](../../app/db.py) — engine (WAL + busy-timeout pragmas on connect), `VinCache` (`cached_at` indexed), get/upsert/delete/purge-expired/enforce-size-cap/list, all bulk operations as a single SQL statement
 - [`app/vpic.py`](../../app/vpic.py) — decode client; raises on transport failure *and* on an all-fields-empty decode
-- [`app/settings.py`](../../app/settings.py) — `CACHE_TTL_SECONDS` (default 604800), `CACHE_SWEEP_INTERVAL_SECONDS` (default 3600), `CACHE_MAX_ROWS` (default 10000), `DATABASE_PATH`, `VPIC_BASE_URL`, `VPIC_TIMEOUT_SECONDS`
-- [`tests/`](../../tests/) — validation, hit/miss, expiry-as-miss, undecodable-VIN, remove, export, WAL pragma, size cap, background sweep
+- [`app/settings.py`](../../app/settings.py) — `CACHE_TTL_SECONDS` (default 604800), `CACHE_SWEEP_INTERVAL_SECONDS` (default 3600), `CACHE_MAX_ROWS` (default 10000), `DATABASE_PATH`, `VPIC_BASE_URL`, `VPIC_TIMEOUT_SECONDS`; numeric settings reject zero/negative values at startup
+- [`tests/test_api.py`](../../tests/test_api.py) — HTTP-level: validation, hit/miss, expiry-as-miss, undecodable-VIN, remove, export, WAL pragma, size cap, background sweep
+- [`tests/test_vpic.py`](../../tests/test_vpic.py) — unit: `decode_vin`/`_field` against a mocked client, every `VpicError` branch
+- [`tests/test_settings.py`](../../tests/test_settings.py) — unit: `get_settings()` defaults, per-field env overrides, positive-value validation
 - [`scripts/demo_concurrency_and_cache_cap.py`](../../scripts/demo_concurrency_and_cache_cap.py) — narrated demo of concurrent duplicate lookups and cache size-cap eviction against a running server (Phase 8)
 - [`pyproject.toml`](../../pyproject.toml) — fastapi, uvicorn, httpx, sqlalchemy, aiosqlite, pyarrow, pytest; `pythonpath = ["."]` so bare `pytest` resolves `app`
 - [`requirements.txt`](../../requirements.txt) / [`requirements-dev.txt`](../../requirements-dev.txt) — pip install on a clean machine
@@ -328,6 +337,7 @@ DB file at `data/cache.db` (gitignored). SQLAlchemy 2.0 async + aiosqlite. Parqu
 - vPIC failure (HTTP error, timeout, invalid JSON, empty `Results`, or all four fields empty) → **502**, nothing written
 - Remove miss → **200** + `deleted: false`
 - Empty / all-expired export → empty parquet
+- Misconfigured env var (non-numeric, or a numeric-but-nonsensical zero/negative `CACHE_TTL_SECONDS` / `CACHE_SWEEP_INTERVAL_SECONDS` / `CACHE_MAX_ROWS` / `VPIC_TIMEOUT_SECONDS`) → app fails to start with a clear `ValueError`, not a silent misbehavior (a `0` sweep interval would otherwise busy-loop the background task)
 - Background sweep failure (e.g. a transient DB error) → logged and retried next interval; never surfaced to a client, since it isn't triggered by a request
 
 ## Out of scope

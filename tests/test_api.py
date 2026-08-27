@@ -1,3 +1,4 @@
+import io
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
@@ -245,8 +246,6 @@ class TestExport:
         assert response.headers["content-type"] == "application/vnd.apache.parquet"
         assert "vin_cache.parquet" in response.headers["content-disposition"]
 
-        import io
-
         table = pq.read_table(io.BytesIO(response.content))
         assert table.column_names == ["vin", "make", "model", "model_year", "body_class"]
         assert table.num_rows == 0
@@ -261,8 +260,6 @@ class TestExport:
         old = (datetime.now(timezone.utc) - timedelta(days=8)).replace(microsecond=0).isoformat()
         seed_row(db_path, "1FTFW1ET9DFC10312", old)
 
-        import io
-
         response = client.get("/export")
         table = pq.read_table(io.BytesIO(response.content))
         vins = set(table.column("vin").to_pylist())
@@ -274,8 +271,6 @@ class TestExport:
             microsecond=0
         ).isoformat()
         seed_row(db_path, SAMPLE_VIN, at_ttl)
-
-        import io
 
         response = client.get("/export")
         table = pq.read_table(io.BytesIO(response.content))

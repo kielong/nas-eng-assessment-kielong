@@ -1,3 +1,6 @@
+import asyncio
+import contextlib
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -7,9 +10,36 @@ from fastapi.responses import FileResponse
 
 from app import db
 from app.routes import router
-from app.settings import get_settings
+from app.settings import Settings, get_settings
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+logger = logging.getLogger(__name__)
+
+
+async def _cache_maintenance_loop(session_factory, settings: Settings) -> None:
+    """Purge expired rows and enforce the row cap on a timer.
+
+    Runs once immediately (covering whatever accumulated since the last
+    process lifetime), then every cache_sweep_interval_seconds. This is the
+    active counterpart to /lookup's and /export's reactive cleanup: without
+    it, a row for a VIN nobody looks up again just sits past its TTL, and
+    TTL alone never caps absolute row count within one TTL window.
+    """
+    while True:
+        try:
+            async with session_factory() as session:
+                purged = await db.purge_expired(session, settings.cache_ttl_seconds)
+                evicted = await db.enforce_size_cap(session, settings.cache_max_rows)
+            if purged or evicted:
+                logger.info(
+                    "cache maintenance: purged %d expired row(s), evicted %d over the %d-row cap",
+                    purged,
+                    evicted,
+                    settings.cache_max_rows,
+                )
+        except Exception:
+            logger.exception("cache maintenance sweep failed; will retry next interval")
+        await asyncio.sleep(settings.cache_sweep_interval_seconds)
 
 
 def create_app() -> FastAPI:
@@ -24,6 +54,7 @@ def create_app() -> FastAPI:
             await conn.run_sync(db.Base.metadata.create_all)
 
         http_client = httpx.AsyncClient(timeout=settings.vpic_timeout_seconds)
+        maintenance_task = asyncio.create_task(_cache_maintenance_loop(session_factory, settings))
         app.state.settings = settings
         app.state.engine = engine
         app.state.session_factory = session_factory
@@ -31,6 +62,9 @@ def create_app() -> FastAPI:
         try:
             yield
         finally:
+            maintenance_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await maintenance_task
             await http_client.aclose()
             await engine.dispose()
 

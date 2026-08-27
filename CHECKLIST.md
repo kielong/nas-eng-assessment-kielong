@@ -26,7 +26,7 @@ These were decided up front so implementation could stay small.
 | Stored columns | Four decode fields + `cached_at` | `cached` is request-scoped. Raw vPIC JSON is not stored. |
 | VIN rules | 17 alphanumeric, uppercase before any cache key | Assignment does not require a check digit. |
 | vPIC | `GET .../DecodeVinValues/{vin}?format=json` | Flat object; map `Make` / `Model` / `ModelYear` / `BodyClass` only. |
-| TTL | Lazy, delete-on-read; env `CACHE_TTL_SECONDS`, default `604800` | VIN attributes almost never change. TTL bounds size and ages out a bad decode. No worker. |
+| TTL | Lazy, delete-on-read; env `CACHE_TTL_SECONDS` (default `604800`), plus a lightweight in-process periodic sweep (`CACHE_SWEEP_INTERVAL_SECONDS`, default `3600`) and a row-count cap (`CACHE_MAX_ROWS`, default `10000`) | VIN attributes almost never change, so freshness isn't the goal — bounding staleness and absolute size is. The sweep is an `asyncio` task in the app's own lifespan, not a new service. |
 | Errors | Invalid VIN **422**; vPIC failure **502**; remove miss **200** + `deleted: false` | The boolean on remove is the result, not an HTTP 404. |
 | Export | Purge expired, then parquet of live rows only | Columns match lookup minus `cached`. Empty cache still yields a valid file. |
 
@@ -65,11 +65,12 @@ Expired-then-vPIC-fails: we delete the stale row first, then call vPIC. A 502 le
 - [x] `get_live`: missing or age ≥ TTL → delete row, return miss
 - [x] `upsert` with a new `cached_at`
 - [x] `delete_vin` (true if a row existed, expired or not)
-- [x] `purge_expired` then `list_all` for export
+- [x] `purge_expired` then `list_all` for export; returns the count it removed
+- [x] `enforce_size_cap`: once the table exceeds `CACHE_MAX_ROWS`, evict the oldest rows by `cached_at` down to the cap
 - [x] `decode_vin`: DecodeVinValues, no `modelyear` query param, ~10s timeout
 - [x] `VpicError` on non-200, timeout, invalid JSON, or empty `Results`
 
-**Done when.** A row can be written, read as live, treated as expired, and deleted. A decode maps four fields and fails closed.
+**Done when.** A row can be written, read as live, treated as expired, and deleted. A decode maps four fields and fails closed. The table never holds more than `CACHE_MAX_ROWS` rows once maintenance has run.
 
 ---
 
@@ -77,7 +78,7 @@ Expired-then-vPIC-fails: we delete the stale row first, then call vPIC. A 502 le
 
 **Goal.** The three assignment routes, using Phase 2 only.
 
-**Context.** Pydantic `VinRequest` normalizes VIN to uppercase, then enforces `^[A-Z0-9]{17}$`. `cached` is never written to SQLite. Parquet via pyarrow (not pandas). App factory + lifespan: create tables, httpx client, engine.
+**Context.** Pydantic `VinRequest` normalizes VIN to uppercase, then enforces `^[A-Z0-9]{17}$`. `cached` is never written to SQLite. Parquet via pyarrow (not pandas). App factory + lifespan: create tables, httpx client, engine, and a periodic in-process maintenance task that keeps the cache within TTL and its row cap without needing a request to trigger it.
 
 **Do**
 
@@ -85,6 +86,7 @@ Expired-then-vPIC-fails: we delete the stale row first, then call vPIC. A 502 le
 - [x] `POST /remove` → `{ "vin", "deleted" }`, HTTP 200 either way
 - [x] `GET /export` → purge expired, parquet attachment `vin_cache.parquet` (`application/vnd.apache.parquet`)
 - [x] Empty / all-expired export is a valid empty table with the five string columns
+- [x] App lifespan starts `_cache_maintenance_loop` (purge expired + enforce row cap) alongside the DB engine and httpx client, cancelled cleanly on shutdown; sweep failures are logged and retried next interval, never surfaced to a request
 
 **Done when.** Lookup miss then hit does not call vPIC twice. Export does not include `cached` or `cached_at`. Invalid VIN is 422.
 
@@ -107,6 +109,8 @@ Expired-then-vPIC-fails: we delete the stale row first, then call vPIC. A 502 le
 - [x] Remove hit then miss (`deleted` true then false)
 - [x] Empty export is valid parquet with the five columns
 - [x] Export includes live rows and drops expired ones from the file and the DB
+- [x] `enforce_size_cap` evicts the oldest rows by `cached_at` once over `CACHE_MAX_ROWS`, and is a no-op under it
+- [x] The background maintenance task purges an expired row and evicts over the cap on its own — seeded before startup, no `/lookup` or `/export` call, polled after the app starts
 
 **Done when.** `pytest` is green offline.
 
@@ -120,7 +124,7 @@ Expired-then-vPIC-fails: we delete the stale row first, then call vPIC. A 502 le
 
 **Do**
 
-- [x] `README.md`: `pip install -r requirements.txt`, uvicorn, PyCharm interpreter note, `/docs` and curl for sample VINs
+- [x] `README.md`: `pip install -r requirements.txt`, uvicorn, PyCharm interpreter note, `/docs` and curl for sample VINs, all six env vars including `CACHE_SWEEP_INTERVAL_SECONDS` / `CACHE_MAX_ROWS`
 - [x] `ASSIGNMENT.md`: original problem statement
 - [x] `NOTES.md`: schema, TTL, vPIC, tradeoffs table, production sketch
 - [x] This checklist as the phase record tied to the design plan

@@ -1,4 +1,5 @@
 import sqlite3
+import time
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -7,7 +8,15 @@ import pytest
 import respx
 from fastapi.testclient import TestClient
 
-from app.db import Base, VinCache, create_engine_and_sessionmaker, is_expired, list_all, purge_expired
+from app.db import (
+    Base,
+    VinCache,
+    create_engine_and_sessionmaker,
+    enforce_size_cap,
+    is_expired,
+    list_all,
+    purge_expired,
+)
 from app.main import create_app
 
 SAMPLE_VIN = "1HGCM82633A004352"
@@ -291,6 +300,105 @@ class TestSqliteConcurrencySettings:
         conn.close()
         assert journal_mode.lower() == "wal"
         assert busy_timeout == 5000
+
+
+class TestSizeCap:
+    @pytest.mark.asyncio
+    async def test_enforce_size_cap_evicts_oldest_rows_by_cached_at(self, tmp_path):
+        engine, session_factory = create_engine_and_sessionmaker(str(tmp_path / "cache.db"))
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        base = datetime(2026, 8, 26, 12, 0, 0, tzinfo=timezone.utc)
+        vins = ["1HGCM82633A004352", "5YJ3E1EA6PF384836", "1FTFW1ET9DFC10312"]
+        async with session_factory() as session:
+            for i, vin in enumerate(vins):
+                # oldest first: vins[0] is the oldest, vins[-1] the newest
+                session.add(
+                    VinCache(
+                        vin=vin,
+                        make="HONDA",
+                        model="Accord",
+                        model_year="2003",
+                        body_class="Sedan/Saloon",
+                        cached_at=(base + timedelta(minutes=i)).isoformat(),
+                    )
+                )
+            await session.commit()
+
+            evicted = await enforce_size_cap(session, max_rows=2)
+            rows = await list_all(session)
+
+        await engine.dispose()
+        assert evicted == 1
+        assert {row.vin for row in rows} == {vins[1], vins[2]}
+
+    @pytest.mark.asyncio
+    async def test_enforce_size_cap_is_a_noop_under_the_cap(self, tmp_path):
+        engine, session_factory = create_engine_and_sessionmaker(str(tmp_path / "cache.db"))
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        async with session_factory() as session:
+            session.add(
+                VinCache(
+                    vin=SAMPLE_VIN,
+                    make="HONDA",
+                    model="Accord",
+                    model_year="2003",
+                    body_class="Sedan/Saloon",
+                    cached_at=datetime.now(timezone.utc).isoformat(),
+                )
+            )
+            await session.commit()
+            evicted = await enforce_size_cap(session, max_rows=10)
+
+        await engine.dispose()
+        assert evicted == 0
+
+
+class TestBackgroundMaintenance:
+    def test_periodic_sweep_purges_expired_and_enforces_size_cap(self, db_path, monkeypatch):
+        # Seed data directly, before the app (and its background sweep) starts,
+        # so the very first sweep tick has something to act on.
+        monkeypatch.setenv("DATABASE_PATH", str(db_path))
+        monkeypatch.setenv("CACHE_TTL_SECONDS", str(TTL_SECONDS))
+        monkeypatch.setenv("CACHE_SWEEP_INTERVAL_SECONDS", "3600")
+        monkeypatch.setenv("CACHE_MAX_ROWS", "2")
+
+        # Table doesn't exist yet on a fresh db_path — the app normally creates it
+        # in its lifespan. Create it directly here so we can seed before startup.
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            """
+            CREATE TABLE vin_cache (
+              vin TEXT PRIMARY KEY, make TEXT NOT NULL, model TEXT NOT NULL,
+              model_year TEXT NOT NULL, body_class TEXT NOT NULL, cached_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        old = (datetime.now(timezone.utc) - timedelta(days=8)).replace(microsecond=0).isoformat()
+        seed_row(db_path, SAMPLE_VIN, old)  # expired: should be purged
+
+        base = datetime.now(timezone.utc)
+        live_vins = ["1FTFW1ET9DFC10312", "1C4RJFBG2FC625797", "5FNRL6H79NB021411"]
+        for i, vin in enumerate(live_vins):
+            # oldest first: over the cap of 2, so live_vins[0] should be evicted
+            seed_row(db_path, vin, (base - timedelta(minutes=3 - i)).isoformat())
+
+        application = create_app()
+        with TestClient(application):
+            deadline = time.monotonic() + 2.0
+            expected = set(live_vins[1:])
+            while time.monotonic() < deadline:
+                if vins_in_db(db_path) == expected:
+                    break
+                time.sleep(0.05)
+            else:
+                pytest.fail(f"background sweep did not converge; vins={vins_in_db(db_path)}")
 
 
 class TestTtlPredicate:

@@ -37,6 +37,8 @@ The SQLite file is created at `data/cache.db`. Optional environment variables:
 | Variable | Default | Meaning |
 |---|---|---|
 | `CACHE_TTL_SECONDS` | `604800` (7 days) | How long a cached decode is considered live |
+| `CACHE_SWEEP_INTERVAL_SECONDS` | `3600` (1 hour) | How often a background task purges expired rows and enforces the row cap |
+| `CACHE_MAX_ROWS` | `10000` | Row cap enforced by the same background task; oldest rows evicted first |
 | `DATABASE_PATH` | `data/cache.db` | SQLite file path |
 | `VPIC_BASE_URL` | `https://vpic.nhtsa.dot.gov/api` | vPIC API root |
 | `VPIC_TIMEOUT_SECONDS` | `10` | HTTP timeout for vPIC |

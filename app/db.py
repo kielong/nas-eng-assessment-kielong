@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from sqlalchemy import Select, Text, event, select
+from sqlalchemy import Select, Text, delete, event, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -103,13 +103,31 @@ async def delete_vin(session: AsyncSession, vin: str) -> bool:
 
 async def purge_expired(
     session: AsyncSession, ttl_seconds: int, now: datetime | None = None
-) -> None:
+) -> int:
     now = now or datetime.now(timezone.utc)
     rows = await list_all(session)
-    for row in rows:
-        if is_expired(row.cached_at, ttl_seconds, now=now):
-            await session.delete(row)
+    expired = [row for row in rows if is_expired(row.cached_at, ttl_seconds, now=now)]
+    for row in expired:
+        await session.delete(row)
     await session.commit()
+    return len(expired)
+
+
+async def enforce_size_cap(session: AsyncSession, max_rows: int) -> int:
+    """Evict the oldest rows (by cached_at) once the table exceeds max_rows.
+
+    TTL alone bounds staleness, not row count: a burst of lookups for
+    distinct VINs within one TTL window still grows the table without a
+    ceiling. This is the size-side complement to purge_expired.
+    """
+    total = await session.scalar(select(func.count()).select_from(VinCache))
+    overflow = (total or 0) - max_rows
+    if overflow <= 0:
+        return 0
+    oldest_vins = select(VinCache.vin).order_by(VinCache.cached_at.asc()).limit(overflow)
+    result = await session.execute(delete(VinCache).where(VinCache.vin.in_(oldest_vins)))
+    await session.commit()
+    return result.rowcount or 0
 
 
 async def list_all(session: AsyncSession) -> list[VinCache]:

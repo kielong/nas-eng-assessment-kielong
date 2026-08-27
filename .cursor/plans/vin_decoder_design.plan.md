@@ -1,12 +1,12 @@
 ---
 name: VIN Decoder Design
-overview: A small FastAPI service with three routes, one SQLite table, and lazy TTL (delete-on-read). JSON, SQL, and parquet share the same field names; only decode data plus cached_at is stored. A Phase 7 hardening pass (see CHECKLIST.md) closed two correctness gaps found on self-review and fixed a pytest packaging bug; both are recorded here as decisions, not patched in silently.
+overview: A small FastAPI service with three routes, one SQLite table, and lazy TTL (delete-on-read) backed by a lightweight in-process periodic sweep that also enforces a row cap. JSON, SQL, and parquet share the same field names; only decode data plus cached_at is stored. A Phase 7 hardening pass (see CHECKLIST.md) closed two correctness gaps found on self-review and fixed a pytest packaging bug; both are recorded here as decisions, not patched in silently.
 todos:
   - id: scaffold
     content: Scaffold pyproject.toml, app package, gitignore, data dir
     status: completed
   - id: db-vpic
-    content: Implement SQLAlchemy vin_cache table (plus cached_at), lazy TTL CRUD, and vPIC DecodeVinValues client
+    content: Implement SQLAlchemy vin_cache table (plus cached_at), lazy TTL CRUD with a periodic sweep and row-count cap, and vPIC DecodeVinValues client
     status: completed
   - id: routes
     content: Implement POST /lookup, POST /remove, GET /export with snake_case schemas
@@ -43,7 +43,7 @@ Snake_case JSON (not the README's display labels). Same names as the table, so t
 | A. `GET /lookup?vin=...` | RESTful for a read, trivially curl/browser-friendly — but the assignment's wording ("the request should contain a single string called `vin`") reads as a body, and a VIN sitting in a query string ends up in server access logs and browser history |
 | B. `POST /lookup` with a JSON body **(chosen)** | Matches the assignment's own wording directly; keeps the VIN out of URLs and logs. Costs some convenience — can't just paste a URL into a browser, worked around with the Phase 6 demo page |
 
-**Why B.** The assignment's own language decided this: "contain a single string" reads as a request body, not a query parameter. `/remove` mirrors `/lookup` for consistency, even though a `DELETE` verb would be more RESTful — the assignment frames all three as fixed named routes, not a resource-oriented API. `/export` stays `GET` because it takes no input and needs to be trivially downloadable (`curl -O -J`, or a plain browser link).
+**Why B.** Independent of how the assignment phrases it, a POST body keeps a per-vehicle identifier out of URLs — no VIN in server access logs or browser history. The assignment's own wording ("contain a single string") also reads as a body rather than a query parameter, so the two reasons point the same way. `/remove` mirrors `/lookup` for consistency, even though a `DELETE` verb would be more RESTful — the assignment frames all three as fixed named routes, not a resource-oriented API. `/export` stays `GET` because it takes no input and needs to be trivially downloadable (`curl -O -J`, or a plain browser link).
 
 **POST `/lookup`**
 
@@ -127,16 +127,18 @@ CREATE TABLE vin_cache (
 
 ## Cache expiration
 
-**Lazy TTL + delete-on-read.** Env var `CACHE_TTL_SECONDS`, default **7 days** (`604800`).
+**Lazy TTL + delete-on-read, backed by a lightweight in-process periodic sweep.** Env var `CACHE_TTL_SECONDS`, default **7 days** (`604800`).
 
 | Option | Tradeoff |
 |---|---|
 | A. No expiration — cache forever | Simplest possible code. But a bad cached decode never self-heals, and the table grows without bound |
-| B. Lazy TTL, delete-on-read **(chosen)** | No background process to run or test; bounds storage opportunistically. Cost: an expired row for a VIN nobody looks up again just sits there until `/export` happens to purge it |
-| C. Background purge (scheduled sweep, or on startup) | Keeps storage tight continuously — adds a scheduler as another moving part to run and test, for a demo cache that's realistically tiny |
+| B. Lazy TTL, delete-on-read, plus a lightweight in-process periodic sweep and a row-count cap **(chosen)** | No new infrastructure — the sweep is an `asyncio` task inside the same process, started and cancelled in the app's own lifespan. Bounds both staleness (TTL) and absolute size (row cap), instead of leaving both purely opportunistic. Cost: the sweep and cap are enforced on an interval (`CACHE_SWEEP_INTERVAL_SECONDS`, default hourly), not instantly on every write — the table can transiently exceed the cap between ticks |
+| C. Background purge via a real scheduler (Celery beat, k8s CronJob, cron hitting an admin route) | Keeps storage tight independent of the app process's own lifetime — but adds a new deployable / infrastructure dependency for a cache that's realistically small in this context |
 | D. Scheduled refresh (re-fetch every cached VIN periodically, regardless of access) | Keeps data maximally fresh — wasteful, since VIN attributes essentially never change; most refetches would be pointless vPIC calls |
 
-**Why B.** VIN attributes are static in practice, so "freshness" isn't really the driver here — the TTL exists to bound cache size and let a genuinely bad cached decode age out, not because good decodes go stale. That makes the simplest option also the correct one; C and D solve a staleness problem this domain doesn't really have, at the cost of real infrastructure.
+**Why B.** VIN attributes are static in practice, so "freshness" isn't the goal — bounding staleness and absolute size is. An in-process periodic task gets both without paying for a scheduler: still zero new infrastructure, just no longer purely reactive. `/lookup` and `/remove` still clean up their own VIN reactively as before; the sweep is what catches everything else — a VIN looked up once and never revisited, or a burst of distinct-VIN traffic within one TTL window that would otherwise grow the table unbounded. C's benefit (enforcement independent of the app process) isn't worth its cost (a new deployable) at this scale; D solves a staleness problem that doesn't really exist here.
+
+Implementation: `app/db.py` adds `enforce_size_cap` (evicts the oldest rows by `cached_at` once the table exceeds `CACHE_MAX_ROWS`, default `10000`) alongside the existing `purge_expired`. `app/main.py`'s lifespan starts a single background task, `_cache_maintenance_loop`, that calls both once immediately at startup and then every `CACHE_SWEEP_INTERVAL_SECONDS`, cancelled cleanly on shutdown. Sweep failures are logged and retried next interval rather than crashing the loop or surfacing as a request-facing error.
 
 ```mermaid
 flowchart TD
@@ -166,7 +168,7 @@ flowchart TD
 - **Lookup:** live row → hit. Missing or expired → delete expired row if present, call vPIC, upsert with new `cached_at`, `cached: false`. vPIC failure (including an undecodable VIN — see below) → 502, nothing written.
 - **Remove:** DELETE by VIN (expired or not). `deleted` reflects whether a row existed.
 - **Export:** DELETE expired rows, then SELECT the rest → parquet. Empty cache still yields a valid empty file.
-- No background worker. Unused expired rows sit until that VIN is looked up or `/export` runs; that is the tradeoff vs. option C above.
+- The periodic sweep (see below) is the backstop for rows nobody's `/lookup` or `/export` ever touches again, and for row count within a single TTL window — it does not change the per-request behavior above.
 
 Expired-then-vPIC-fails: we delete the stale row first, then call vPIC. A 502 leaves the VIN uncached — intentional, no stale reads, called out in NOTES.md.
 
@@ -234,7 +236,7 @@ flowchart TD
 
 **Why B**, with a mitigation: the Phase 7 "all fields empty" rule (see "vPIC client") wasn't guessed — it was verified by hitting the live API by hand for both a real sample VIN and a garbage one, once, before writing the mocked test around that confirmed shape. The mocks encode a contract that was checked against the real thing, not assumed.
 
-21 tests across `tests/test_api.py`: request validation, lookup miss/hit/expiry, vPIC failure modes (HTTP error, timeout, invalid JSON, empty `Results`, all-fields-empty), remove hit/miss, export (empty, mixed live/expired, exact-TTL boundary), the demo page, and the SQLite WAL/busy-timeout pragmas.
+24 tests across `tests/test_api.py`: request validation, lookup miss/hit/expiry, vPIC failure modes (HTTP error, timeout, invalid JSON, empty `Results`, all-fields-empty), remove hit/miss, export (empty, mixed live/expired, exact-TTL boundary), the demo page, the SQLite WAL/busy-timeout pragmas, size-cap eviction (unit-level), and one integration test proving the background sweep purges an expired row and evicts over the row cap on its own, with no `/lookup` or `/export` call — seeded directly into the SQLite file before the app starts, polled for up to 2 seconds after startup.
 
 ## Packaging & tooling
 
@@ -260,14 +262,14 @@ A small page at `GET /` ([`app/static/index.html`](../../app/static/index.html))
 
 ## Project layout
 
-- [`app/main.py`](../../app/main.py) — FastAPI app, lifespan (DB + httpx), include router, serve `GET /`
+- [`app/main.py`](../../app/main.py) — FastAPI app, lifespan (DB + httpx + `_cache_maintenance_loop` background task), include router, serve `GET /`
 - [`app/static/index.html`](../../app/static/index.html) — demo page (lookup / remove / export)
 - [`app/schemas.py`](../../app/schemas.py) — `VinRequest`, `LookupResponse`, `RemoveResponse`
 - [`app/routes.py`](../../app/routes.py) — three endpoints
-- [`app/db.py`](../../app/db.py) — engine (WAL + busy-timeout pragmas on connect), `VinCache`, get/upsert/delete/purge-expired/list
+- [`app/db.py`](../../app/db.py) — engine (WAL + busy-timeout pragmas on connect), `VinCache`, get/upsert/delete/purge-expired/enforce-size-cap/list
 - [`app/vpic.py`](../../app/vpic.py) — decode client; raises on transport failure *and* on an all-fields-empty decode
-- [`app/settings.py`](../../app/settings.py) — `CACHE_TTL_SECONDS` (default 604800), `DATABASE_PATH`, `VPIC_BASE_URL`, `VPIC_TIMEOUT_SECONDS`
-- [`tests/`](../../tests/) — validation, hit/miss, expiry-as-miss, undecodable-VIN, remove, export, WAL pragma
+- [`app/settings.py`](../../app/settings.py) — `CACHE_TTL_SECONDS` (default 604800), `CACHE_SWEEP_INTERVAL_SECONDS` (default 3600), `CACHE_MAX_ROWS` (default 10000), `DATABASE_PATH`, `VPIC_BASE_URL`, `VPIC_TIMEOUT_SECONDS`
+- [`tests/`](../../tests/) — validation, hit/miss, expiry-as-miss, undecodable-VIN, remove, export, WAL pragma, size cap, background sweep
 - [`pyproject.toml`](../../pyproject.toml) — fastapi, uvicorn, httpx, sqlalchemy, aiosqlite, pyarrow, pytest; `pythonpath = ["."]` so bare `pytest` resolves `app`
 - [`requirements.txt`](../../requirements.txt) / [`requirements-dev.txt`](../../requirements-dev.txt) — pip install on a clean machine
 - [`README.md`](../../README.md) — run from a clean checkout; how to try sample VINs
@@ -283,7 +285,8 @@ DB file at `data/cache.db` (gitignored). SQLAlchemy 2.0 async + aiosqlite. Parqu
 - vPIC failure (HTTP error, timeout, invalid JSON, empty `Results`, or all four fields empty) → **502**, nothing written
 - Remove miss → **200** + `deleted: false`
 - Empty / all-expired export → empty parquet
+- Background sweep failure (e.g. a transient DB error) → logged and retried next interval; never surfaced to a client, since it isn't triggered by a request
 
 ## Out of scope
 
-No auth, no VIN check-digit validation, no extra API routes, no background purge job, no per-VIN request-coalescing lock, no Postgres migration. No SPA framework, login, field editing, or TTL admin UI. The last three items are discussed as deliberate deferrals — not oversights — in NOTES.md, "If this had to handle real traffic."
+No auth, no VIN check-digit validation, no extra API routes, no external scheduler (cron/k8s CronJob/task queue) for cache maintenance — the periodic sweep is an in-process `asyncio` task, not a new service. No per-VIN request-coalescing lock, no Postgres migration, no SPA framework, login, field editing, or TTL admin UI. These are discussed as deliberate deferrals — not oversights — in NOTES.md, "If this had to handle real traffic."

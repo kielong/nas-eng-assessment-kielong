@@ -11,7 +11,8 @@ We used AI as a coding assistant, not as the source of the design. Order of work
 5. Build in the phases below. A later phase does not start until the earlier one is done.
 6. A demo UI is a later phase so a presentation does not need Postman. It is specified here and built in Phase 6.
 7. Phase 6 was the end of the original submission. Phase 7 is a self-review pass: read the finished implementation back against the assignment, find what it got wrong, fix only what's in scope.
-8. Phase 8 makes two already-shipped behaviors (Phase 2/3's size cap, and the documented no-lock tradeoff) *visible* with a narrated demo script, instead of only asserted in NOTES.md. Planned in the design plan first, reviewed, then built.
+8. Phase 8 makes two already-shipped behaviors (Phase 2/3's size cap, and the documented no-lock tradeoff) *visible* with a narrated demo script, instead of only asserted in NOTES.md. Planned in the design plan first, reviewed, then built. A later pass on that script named the WAL dependency, the transient over-cap, and that hits do not refresh `cached_at`.
+9. Phase 9 adds a second narrated demo script for the reactive TTL path (hit inside the window, miss after expiry). It is a separate script because a short `CACHE_TTL_SECONDS` on the same process as the cap demo would expire early rows and look like size-cap eviction.
 
 Do not invent extra routes, extra columns, or a background worker unless a later phase says so.
 
@@ -204,16 +205,38 @@ Design lives in `.cursor/plans/vin_decoder_design.plan.md`, "Demo script: concur
 **Do**
 
 - [x] `scripts/demo_concurrency_and_cache_cap.py`, using `httpx.AsyncClient` against a real, already-running server (`uvicorn app.main:app`) — no new dependency, no in-process ASGI shortcut, so the demo matches exactly what an interviewer watching the server's own logs would see
-- [x] Demo 1 — concurrent duplicate lookup: `POST /remove` the demo VIN first for a clean starting state, then two `POST /lookup` calls fired together via `asyncio.gather`, each timed and printed with its `cached` value; a third, sequential lookup afterward shows `cached: true` as a bookend contrast
-- [x] Demo 2 — cache size cap: sequential `POST /lookup` for all 7 assignment sample VINs, spaced 1.1s apart so each gets a distinct `cached_at` second and eviction order is unambiguous (deliberately the known-good sample list, not synthetic VINs — Phase 7's all-empty-fields check would reject and never cache a fake one)
+- [x] Demo 1 — concurrent duplicate lookup: `POST /remove` the demo VIN first for a clean starting state, then two `POST /lookup` calls fired together via `asyncio.gather`, each timed and printed with its `cached` value; a third, sequential lookup afterward shows `cached: true` as a bookend contrast. Narration points at the uvicorn logs (two DecodeVinValues) and at WAL + `busy_timeout` (those overlapping upserts would have been `database is locked` without it)
+- [x] Demo 2 — cache size cap: sequential `POST /lookup` for all 7 assignment sample VINs, spaced 1.1s apart so each gets a distinct `cached_at` second and eviction order is unambiguous (deliberately the known-good sample list, not synthetic VINs — Phase 7's all-empty-fields check would reject and never cache a fake one). Immediately after the first miss, the same VIN is looked up again (a hit, while still under the cap) so eviction of that VIN later proves hits do not refresh `cached_at` (not LRU). Step 3 names the transient over-cap: export shows 7 rows against a cap of 3 because the cap is on a timer, not on every write
 - [x] `RECOMMENDED_DEMO_CACHE_MAX_ROWS = 3` constant with a comment explaining production would set `CACHE_MAX_ROWS` much larger (e.g. 100,000+, sized to expected distinct-VIN volume within one TTL window) — this value exists only to make eviction visible within 7 requests, not as a production recommendation
-- [x] Startup banner (in the module docstring, and on an unreachable-server error) stating the exact env vars to start the server with (`CACHE_MAX_ROWS`, `CACHE_SWEEP_INTERVAL_SECONDS`), plus a `DEMO_BASE_URL` override for a non-default host/port
+- [x] Startup banner (in the module docstring, and on an unreachable-server error) stating the exact env vars to start the server with (`DATABASE_PATH=data/demo.db`, `CACHE_MAX_ROWS`, `CACHE_SWEEP_INTERVAL_SECONDS`), no `--reload` (a save during the wait would restart the process and reset sweep timing), plus a `DEMO_BASE_URL` override for a non-default host/port
+- [x] Clear every live cache row before Demo 2 (not just the sample list), so leftover VINs cannot steal an eviction slot; print survivors/evicted in sample-list order (export is alphabetical by vin); assert the last 3 samples survived, not merely that the count dropped
 - [x] Friendly, non-crashing output if the server isn't reachable (checked up front, exits with the start-server command) or if a request fails mid-run (caught around both demos, prints a hint instead of a traceback)
+- [x] Talking points printed during the eviction wait so the 15s window is not dead air (export schema, production cap sizing, non-LRU)
 
 **Found and fixed during manual testing:** an early version declared eviction "done" as soon as the row count first dropped below 7. Live testing against a real server (`uvicorn`, `CACHE_MAX_ROWS=3`, `CACHE_SWEEP_INTERVAL_SECONDS=5`) showed why that's wrong — a sweep tick firing *while* the 7 lookups are still landing can evict early, then more rows land afterward, settling on a count that's lower but not yet converged to the real cap (observed: 5 rows instead of 3). Fixed by always waiting a fixed window (`2 × sweep interval + 5s`) *after* the last write finishes, guaranteeing at least one clean tick sees the fully-settled row set, rather than trusting the first observed decrease. Re-verified twice against a live server afterward: both runs converged correctly (4 evicted, the 3 most-recently-looked-up VINs survived).
 
 **Found and fixed during a later code-quality pass:** `check_server_reachable` only caught `httpx.ConnectError`. `httpx.ConnectTimeout` is a sibling, not a subclass, of `ConnectError` — confirmed with `issubclass()` against the actual installed httpx version rather than assumed — so a server that's listening but hung would fall through this check and crash with a raw traceback instead of the friendly "start the server with..." message, defeating the point of the script. Fixed by catching `httpx.TransportError` instead, the common parent of both. Same verification approach: checked the real class hierarchy before and after the fix, not just re-read the code.
 
-**Out of scope for this phase.** No new pytest test — this is a narrated demo for a human, not a CI regression check; the underlying behaviors already have their own tests from Phases 2/3/4/7. No change to `CACHE_MAX_ROWS`'s production default. No in-process server startup by the script itself (see plan.md, option A vs B).
+**Out of scope for this phase.** No new pytest test — this is a narrated demo for a human, not a CI regression check; the underlying behaviors already have their own tests from Phases 2/3/4/7. No change to `CACHE_MAX_ROWS`'s production default. No in-process server startup by the script itself (see plan.md, option A vs B). TTL is Phase 9: a short `CACHE_TTL_SECONDS` on this same process would expire early rows during the cap wait and look like size-cap eviction.
 
 **Done when.** With the server running as documented above, `python scripts/demo_concurrency_and_cache_cap.py` runs standalone and narrates both behaviors clearly enough that no further explanation is needed live. Verified against a real running server, not just read through.
+
+---
+
+## Phase 9 — Demo script: TTL
+
+Design lives in `.cursor/plans/vin_decoder_design.plan.md`, "Demo script: TTL."
+
+**Goal.** A second standalone script a reviewer can run live to *show* the reactive TTL path that was previously only documented in NOTES.md: a hit inside the window, a miss after expiry, and that `get_live` deletes the expired row before calling vPIC (fail-closed). Separate from Phase 8 because the two demos need incompatible server env vars. Adds no new application behavior.
+
+**Do**
+
+- [x] `scripts/demo_ttl.py`, same pattern as Phase 8: `httpx.AsyncClient` against a real, already-running server — no new dependency, no in-process ASGI shortcut
+- [x] Remove the demo VIN, miss (vPIC), immediate hit (SQLite), wait `CACHE_TTL_SECONDS + 2` for second-precision `cached_at`, miss again (vPIC). Narration names TTL as a bound on a bad entry, not a freshness strategy, and names fail-closed without taking vPIC down live (that path is `test_expired_row_then_vpic_failure_leaves_vin_uncached`)
+- [x] Wait does not call `/lookup`, `/remove`, or `/export` — so expiry is `get_live`'s delete-on-read, not export's purge-expired side effect and not the background sweep
+- [x] Startup banner with `DATABASE_PATH=data/demo.db CACHE_TTL_SECONDS=8 uvicorn app.main:app` (no `--reload`); `CACHE_SWEEP_INTERVAL_SECONDS` stays at the production default; docstring warns not to combine with Phase 8's `CACHE_MAX_ROWS=3` on the same process
+- [x] Talking points during the wait; friendly unreachable-server and mid-run HTTP error handling matching Phase 8
+
+**Out of scope for this phase.** No new pytest test. No change to the production 7-day TTL default. No live 502 by taking vPIC down. No wrapping of 422 / empty-decode / export-filename checks — those stay curl/UI.
+
+**Done when.** With the server running as documented above, `python scripts/demo_ttl.py` runs standalone and narrates hit-then-expiry-miss clearly enough that no further explanation is needed live.

@@ -16,6 +16,8 @@ This is a cache, so it needs a ceiling. A database is allowed to grow with the b
 
 `GET /` is a static page over the same three routes so a walkthrough does not need Postman. It adds no API and no columns. OpenAPI is unchanged.
 
+Two behaviors that are easy to claim and hard to watch — concurrent first-miss without a lock, and a size cap that is not LRU and not enforced on write — are narrated live by `scripts/demo_concurrency_and_cache_cap.py`. The reactive TTL path (hit inside the window, miss after expiry, delete-before-vPIC) is `scripts/demo_ttl.py`. They need different server env vars, so they are separate scripts; run commands are in each file's docstring and in README.md.
+
 ## Tradeoffs
 
 Decisions I had latitude on — not the ones that were already fixed (three routes, SQLite, 17-alphanumeric VINs).

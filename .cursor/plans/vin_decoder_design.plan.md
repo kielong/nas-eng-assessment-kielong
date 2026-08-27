@@ -26,6 +26,9 @@ todos:
   - id: demo-script
     content: "Phase 8: standalone script demoing concurrent duplicate lookups and cache size-cap eviction against a running server"
     status: completed
+  - id: demo-ttl
+    content: "Phase 9: standalone script demoing reactive TTL (hit inside the window, miss after expiry) against a running server"
+    status: completed
 isProject: false
 ---
 
@@ -33,7 +36,7 @@ isProject: false
 
 A FastAPI app that caches NHTSA vPIC VIN decodes in one SQLite table. JSON, SQL, and parquet use the same column names. `cached` is computed, never stored. The only extra stored field is `cached_at`, for lazy TTL.
 
-This document is a decision log, not just a final-state spec: each design choice below lists the alternatives that were actually on the table, what they'd have cost, and why the chosen option won. The historical build order and per-file "done" record live in [CHECKLIST.md](../../CHECKLIST.md); the interview-facing tradeoffs and production discussion live in [NOTES.md](../../NOTES.md).
+This document is a decision log, not just a final-state spec: each design choice below lists the alternatives that were actually on the table, what they'd have cost, and why the chosen option won. The historical build order and per-file "done" record live in [CHECKLIST.md](../../CHECKLIST.md); the interview-facing tradeoffs and production discussion live in [NOTES.md](../../NOTES.md). Live walkthroughs of the hard-to-see cache decisions are `scripts/demo_concurrency_and_cache_cap.py` and `scripts/demo_ttl.py`.
 
 ## API schema
 
@@ -311,15 +314,47 @@ That fixed-window wait replaced an earlier "declare success as soon as the row c
 
 A second bug surfaced during a later code-quality pass: `check_server_reachable` only caught `httpx.ConnectError`, but `httpx.ConnectTimeout` is a sibling exception, not a subclass — confirmed with `issubclass()` against the installed httpx version, not assumed — so a server that's listening but hung would crash the script with a raw traceback instead of the friendly message it exists to show. Fixed by catching `httpx.TransportError`, the common parent of both.
 
+**Later review pass (same script, not a new file).** A senior read of this script against NOTES.md found it already *exercised* three more decisions than it *named*. Those are now in the narration, not left as talk-track:
+
+- Demo 1 tells the interviewer to watch uvicorn for two `DecodeVinValues` of the same VIN, then names WAL + `busy_timeout=5000`: those overlapping upserts would have raised `database is locked` under the default rollback journal. The script previously proved the no-lock tradeoff and silently depended on the WAL tradeoff.
+- Demo 2 Step 3 (export showing 7 rows against a cap of 3) is now named as the "cap on a timer, not on every write" row, not treated as a waiting step.
+- Immediately after the first sample VIN's miss, the same VIN is looked up again (a hit, while the cache is still under the cap) so that VIN staying among the evicted set later proves hits do not refresh `cached_at`. Re-hitting it *after* filling the cache would be wrong: a sweep that already evicted it would make `/lookup` recache it as newest and invert the narrative.
+- Survivors/evicted are printed in sample-list order (`list_all` / `/export` is alphabetical by vin). Success is "last 3 samples survived", not "count dropped below 7".
+- Live cache is cleared entirely before Demo 2, not just the sample list. Start command uses `DATABASE_PATH=data/demo.db` and drops `--reload` (a save during the wait restarts the process and resets sweep timing). Talking points print during the wait so the 15s window is not dead air.
+
 **How to run it:**
 
 ```bash
-CACHE_MAX_ROWS=3 CACHE_SWEEP_INTERVAL_SECONDS=5 uvicorn app.main:app --reload
+DATABASE_PATH=data/demo.db CACHE_MAX_ROWS=3 CACHE_SWEEP_INTERVAL_SECONDS=5 uvicorn app.main:app
 # in a second terminal:
 python scripts/demo_concurrency_and_cache_cap.py
 ```
 
 No new dependency — `httpx` and `pyarrow` are already in `pyproject.toml`/`requirements.txt`. `DEMO_BASE_URL` (default `http://127.0.0.1:8000`) lets it point at a non-default host/port.
+
+## Demo script: TTL
+
+The reactive TTL path (hit inside the window, miss after expiry, delete-expired-before-vPIC) is the other half of cache maintenance and cannot share a process with the cap demo: `CACHE_TTL_SECONDS=8` during that script's wait would expire early rows and look like size-cap eviction. `scripts/demo_ttl.py` is therefore a second file with its own server command, same HTTP-against-real-uvicorn shape as Phase 8.
+
+| Option | Tradeoff |
+|---|---|
+| A. Fold TTL into `demo_concurrency_and_cache_cap.py` | One command, one file to remember | The two demos need incompatible env vars; combining them contaminates the cap narrative |
+| B. A second script with its own start command **(chosen)** | Reviewer restarts uvicorn once between demos | Each file walks top-to-bottom against one server config; no contaminated eviction |
+| C. One script that starts/stops uvicorn itself between halves | Self-contained | Loses the "watch the server's own logs" property both scripts exist for |
+
+**Why B.** Same reason Phase 8 is not in-process ASGI: the interviewer is watching a terminal they started.
+
+**What it shows.** Remove the assignment's first sample VIN, miss (vPIC), immediate hit (SQLite — TTL is a bound on a bad entry, not a freshness strategy), wait `CACHE_TTL_SECONDS + 2` (second-precision `cached_at` slack), miss again (vPIC). The wait does not call `/lookup`, `/remove`, or `/export`, so expiry is `get_live`'s delete-on-read, not export's purge-expired side effect and not the background sweep. Fail-closed (expired-then-vPIC-fails leaves the VIN uncached) is named in the narration and pointed at the existing unit test rather than by taking vPIC down live.
+
+**How to run it:**
+
+```bash
+DATABASE_PATH=data/demo.db CACHE_TTL_SECONDS=8 uvicorn app.main:app
+# in a second terminal:
+python scripts/demo_ttl.py
+```
+
+`CACHE_SWEEP_INTERVAL_SECONDS` stays at the production default. `DEMO_BASE_URL` same as the other script.
 
 ## Project layout
 
@@ -333,7 +368,8 @@ No new dependency — `httpx` and `pyarrow` are already in `pyproject.toml`/`req
 - [`tests/test_api.py`](../../tests/test_api.py) — HTTP-level: validation, hit/miss, expiry-as-miss, undecodable-VIN, remove, export, WAL pragma, size cap, background sweep
 - [`tests/test_vpic.py`](../../tests/test_vpic.py) — unit: `decode_vin`/`_field` against a mocked client, every `VpicError` branch
 - [`tests/test_settings.py`](../../tests/test_settings.py) — unit: `get_settings()` defaults, per-field env overrides, positive-value validation
-- [`scripts/demo_concurrency_and_cache_cap.py`](../../scripts/demo_concurrency_and_cache_cap.py) — narrated demo of concurrent duplicate lookups and cache size-cap eviction against a running server (Phase 8)
+- [`scripts/demo_concurrency_and_cache_cap.py`](../../scripts/demo_concurrency_and_cache_cap.py) — narrated demo of concurrent duplicate lookups, WAL under overlapping writes, transient over-cap, and non-LRU size-cap eviction against a running server (Phase 8)
+- [`scripts/demo_ttl.py`](../../scripts/demo_ttl.py) — narrated demo of reactive TTL: hit inside the window, miss after expiry, delete-before-vPIC (Phase 9)
 - [`pyproject.toml`](../../pyproject.toml) — fastapi, uvicorn, httpx, sqlalchemy, aiosqlite, pyarrow, pytest; `pythonpath = ["."]` so bare `pytest` resolves `app`
 - [`requirements.txt`](../../requirements.txt) / [`requirements-dev.txt`](../../requirements-dev.txt) — pip install on a clean machine
 - [`README.md`](../../README.md) — run from a clean checkout; how to try sample VINs

@@ -79,17 +79,21 @@ done
 curl -s -O -J http://127.0.0.1:8000/export
 ```
 
-## Demo script: concurrency and cache cap
+## Demo scripts
 
-`scripts/demo_concurrency_and_cache_cap.py` narrates two behaviors live that are otherwise only documented in [NOTES.md](NOTES.md)'s tradeoffs table:
+Two standalone scripts narrate cache behaviors live that are otherwise only documented in [NOTES.md](NOTES.md)'s tradeoffs table. Each talks to a real, already-running server over HTTP — it doesn't start one itself — so the interviewer can watch uvicorn logs in the other terminal. They need **different** server env vars (a short TTL during the cap demo's wait would expire early rows and look like size-cap eviction), so they are separate scripts with separate start commands. Both use `DATABASE_PATH=data/demo.db` so leftover rows in `data/cache.db` are not the ones evicted or expired, and neither uses `--reload` (a save during a wait would restart the process and reset sweep/TTL timing). `DEMO_BASE_URL` (default `http://127.0.0.1:8000`) points either script at a different host/port if needed.
 
-1. **No per-VIN lock on cache-miss** — two concurrent `POST /lookup` calls for the same never-before-cached VIN both independently call vPIC.
-2. **Cache size-cap eviction** — once the cache exceeds `CACHE_MAX_ROWS`, the background maintenance task evicts the oldest rows on its own, with no `/lookup`, `/remove`, or `/export` call causing it directly.
+### Concurrency and cache cap
 
-It talks to a real, already-running server over HTTP — it doesn't start one itself — so start the server with a small cache cap first (the production default, 10,000, can't be practically watched live):
+`scripts/demo_concurrency_and_cache_cap.py`:
+
+1. **No per-VIN lock on cache-miss** — two concurrent `POST /lookup` calls for the same never-before-cached VIN both independently call vPIC. The overlapping upserts are also why WAL + `busy_timeout` exist.
+2. **Cache size-cap eviction** — once the cache exceeds `CACHE_MAX_ROWS`, the background maintenance task evicts the oldest rows on its own. The cap is not enforced on every write (the table is allowed to go over it until the next tick), and a cache hit does not refresh `cached_at` (this is not LRU).
+
+Start the server with a small cache cap first (the production default, 10,000, can't be practically watched live):
 
 ```bash
-CACHE_MAX_ROWS=3 CACHE_SWEEP_INTERVAL_SECONDS=5 uvicorn app.main:app --reload
+DATABASE_PATH=data/demo.db CACHE_MAX_ROWS=3 CACHE_SWEEP_INTERVAL_SECONDS=5 uvicorn app.main:app
 ```
 
 Then, in a second terminal (same virtualenv):
@@ -98,7 +102,28 @@ Then, in a second terminal (same virtualenv):
 python scripts/demo_concurrency_and_cache_cap.py
 ```
 
-It uses the 7 sample VINs above and takes about 20–25 seconds — most of that is the script deliberately waiting out a full sweep-interval window so the cache size cap has actually converged before it reports the result, rather than reporting a still-settling intermediate count. `DEMO_BASE_URL` (default `http://127.0.0.1:8000`) points it at a different host/port if needed.
+It uses the 7 sample VINs above and takes about 20–25 seconds — most of that is the script deliberately waiting out a full sweep-interval window so the cache size cap has actually converged before it reports the result, rather than reporting a still-settling intermediate count.
+
+### TTL
+
+`scripts/demo_ttl.py`:
+
+1. **Hit inside the window** — a second lookup before `CACHE_TTL_SECONDS` is served from SQLite. VIN attributes almost never change, so the TTL is a bound on a bad cache entry, not a freshness strategy.
+2. **Miss after expiry** — `/lookup` deletes the expired row *before* calling vPIC, then writes a fresh row. Fail-closed: a vPIC outage at that moment would be a 502 with nothing left in the cache.
+
+Start the server with a short TTL first (the production default, 7 days, can't be waited out live):
+
+```bash
+DATABASE_PATH=data/demo.db CACHE_TTL_SECONDS=8 uvicorn app.main:app
+```
+
+Then, in a second terminal (same virtualenv):
+
+```bash
+python scripts/demo_ttl.py
+```
+
+Takes about 12–15 seconds, most of that waiting past the 8-second TTL. `CACHE_SWEEP_INTERVAL_SECONDS` can stay at the production default — this script is the `/lookup` reactive path, not the background sweep.
 
 ## API
 

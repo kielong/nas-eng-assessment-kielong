@@ -11,6 +11,7 @@ We used AI as a coding assistant, not as the source of the design. Order of work
 5. Build in the phases below. A later phase does not start until the earlier one is done.
 6. A demo UI is a later phase so a presentation does not need Postman. It is specified here and built in Phase 6.
 7. Phase 6 was the end of the original submission. Phase 7 is a self-review pass: read the finished implementation back against the assignment, find what it got wrong, fix only what's in scope.
+8. Phase 8 makes two already-shipped behaviors (Phase 2/3's size cap, and the documented no-lock tradeoff) *visible* with a narrated demo script, instead of only asserted in NOTES.md. Planned in the design plan first, reviewed, then built.
 
 Do not invent extra routes, extra columns, or a background worker unless a later phase says so.
 
@@ -183,3 +184,26 @@ A per-VIN request lock (to collapse concurrent duplicate vPIC calls) and vPIC's 
 **Verified manually.** The `pythonpath` fix was confirmed by reproducing `ModuleNotFoundError` in a properly isolated fresh venv (`pip install -r requirements-dev.txt` only, no editable install), then re-running `pytest` against that same venv after the fix.
 
 **Done when.** `pytest` is still green offline — including a bare `pytest` invocation with no editable install — and all three fixes are demonstrable without any new routes, columns, or dependencies.
+
+---
+
+## Phase 8 — Demo script: concurrency and cache cap
+
+Design lives in `.cursor/plans/vin_decoder_design.plan.md`, "Demo script: concurrency and cache cap."
+
+**Goal.** A standalone script a reviewer can run live, next to the running app, to *show* two behaviors that were previously only documented in NOTES.md's tradeoffs table: no per-VIN request coalescing on cache-miss, and size-cap eviction. Not a pytest test — a narrated demo, the terminal-and-live-server equivalent of Phase 6's browser UI. Adds no new application behavior; both behaviors already existed in the shipped app.
+
+**Do**
+
+- [x] `scripts/demo_concurrency_and_cache_cap.py`, using `httpx.AsyncClient` against a real, already-running server (`uvicorn app.main:app`) — no new dependency, no in-process ASGI shortcut, so the demo matches exactly what an interviewer watching the server's own logs would see
+- [x] Demo 1 — concurrent duplicate lookup: `POST /remove` the demo VIN first for a clean starting state, then two `POST /lookup` calls fired together via `asyncio.gather`, each timed and printed with its `cached` value; a third, sequential lookup afterward shows `cached: true` as a bookend contrast
+- [x] Demo 2 — cache size cap: sequential `POST /lookup` for all 7 assignment sample VINs, spaced 1.1s apart so each gets a distinct `cached_at` second and eviction order is unambiguous (deliberately the known-good sample list, not synthetic VINs — Phase 7's all-empty-fields check would reject and never cache a fake one)
+- [x] `RECOMMENDED_DEMO_CACHE_MAX_ROWS = 3` constant with a comment explaining production would set `CACHE_MAX_ROWS` much larger (e.g. 100,000+, sized to expected distinct-VIN volume within one TTL window) — this value exists only to make eviction visible within 7 requests, not as a production recommendation
+- [x] Startup banner (in the module docstring, and on an unreachable-server error) stating the exact env vars to start the server with (`CACHE_MAX_ROWS`, `CACHE_SWEEP_INTERVAL_SECONDS`), plus a `DEMO_BASE_URL` override for a non-default host/port
+- [x] Friendly, non-crashing output if the server isn't reachable (checked up front, exits with the start-server command) or if a request fails mid-run (caught around both demos, prints a hint instead of a traceback)
+
+**Found and fixed during manual testing:** an early version declared eviction "done" as soon as the row count first dropped below 7. Live testing against a real server (`uvicorn`, `CACHE_MAX_ROWS=3`, `CACHE_SWEEP_INTERVAL_SECONDS=5`) showed why that's wrong — a sweep tick firing *while* the 7 lookups are still landing can evict early, then more rows land afterward, settling on a count that's lower but not yet converged to the real cap (observed: 5 rows instead of 3). Fixed by always waiting a fixed window (`2 × sweep interval + 5s`) *after* the last write finishes, guaranteeing at least one clean tick sees the fully-settled row set, rather than trusting the first observed decrease. Re-verified twice against a live server afterward: both runs converged correctly (4 evicted, the 3 most-recently-looked-up VINs survived).
+
+**Out of scope for this phase.** No new pytest test — this is a narrated demo for a human, not a CI regression check; the underlying behaviors already have their own tests from Phases 2/3/4/7. No change to `CACHE_MAX_ROWS`'s production default. No in-process server startup by the script itself (see plan.md, option A vs B).
+
+**Done when.** With the server running as documented above, `python scripts/demo_concurrency_and_cache_cap.py` runs standalone and narrates both behaviors clearly enough that no further explanation is needed live. Verified against a real running server, not just read through.

@@ -79,6 +79,27 @@ done
 curl -s -O -J http://127.0.0.1:8000/export
 ```
 
+## Demo script: concurrency and cache cap
+
+`scripts/demo_concurrency_and_cache_cap.py` narrates two behaviors live that are otherwise only documented in [NOTES.md](NOTES.md)'s tradeoffs table:
+
+1. **No per-VIN lock on cache-miss** — two concurrent `POST /lookup` calls for the same never-before-cached VIN both independently call vPIC.
+2. **Cache size-cap eviction** — once the cache exceeds `CACHE_MAX_ROWS`, the background maintenance task evicts the oldest rows on its own, with no `/lookup`, `/remove`, or `/export` call causing it directly.
+
+It talks to a real, already-running server over HTTP — it doesn't start one itself — so start the server with a small cache cap first (the production default, 10,000, can't be practically watched live):
+
+```bash
+CACHE_MAX_ROWS=3 CACHE_SWEEP_INTERVAL_SECONDS=5 uvicorn app.main:app --reload
+```
+
+Then, in a second terminal (same virtualenv):
+
+```bash
+python scripts/demo_concurrency_and_cache_cap.py
+```
+
+It uses the 7 sample VINs above and takes about 20–25 seconds — most of that is the script deliberately waiting out a full sweep-interval window so the cache size cap has actually converged before it reports the result, rather than reporting a still-settling intermediate count. `DEMO_BASE_URL` (default `http://127.0.0.1:8000`) points it at a different host/port if needed.
+
 ## API
 
 VIN values must be exactly 17 alphanumeric characters. They are normalized to uppercase.

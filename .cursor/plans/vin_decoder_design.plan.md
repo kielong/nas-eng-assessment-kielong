@@ -23,6 +23,9 @@ todos:
   - id: hardening
     content: "Phase 7: undecodable-VIN caching, SQLite WAL concurrency, pytest pythonpath fix"
     status: completed
+  - id: demo-script
+    content: "Phase 8: standalone script demoing concurrent duplicate lookups and cache size-cap eviction against a running server"
+    status: completed
 isProject: false
 ---
 
@@ -260,6 +263,45 @@ A small page at `GET /` ([`app/static/index.html`](../../app/static/index.html))
 
 **Why B.** The backend is the deliverable being evaluated; the UI only needs to make it demoable without Postman, not showcase frontend engineering.
 
+## Demo script: concurrency and cache cap
+
+Two behaviors are currently only documented in prose (NOTES.md's tradeoffs table): no per-VIN request coalescing on cache-miss, and size-cap eviction. `scripts/demo_concurrency_and_cache_cap.py` makes both visible in a live walkthrough instead of asked-about.
+
+| Option | Tradeoff |
+|---|---|
+| A. In-process ASGI transport (`httpx.ASGITransport`, script drives the app's own lifespan directly) | Fully self-contained — one command, no separate server process, deterministic control over `CACHE_MAX_ROWS`/`CACHE_SWEEP_INTERVAL_SECONDS` via env vars the script sets itself before creating the app | Doesn't match what an interviewer would see watching a real `uvicorn` terminal — less visceral for a live walkthrough, and diverges from how the Phase 6 demo UI and the README's curl examples already work |
+| B. `httpx.AsyncClient` against a real, separately-running `uvicorn` server **(chosen)** | Matches exactly how everything else demoable in this project already works — the interviewer sees the real server's own logs scroll as the script runs | Requires the server to be started with specific env vars for the size-cap half to be practical to watch; the script can't set those itself, so it prints them instead |
+| C. A pytest test instead of a standalone script | Runs in CI, catches regressions automatically | Not what was asked for — a pass/fail dot doesn't narrate anything to a human watching a demo. The underlying behaviors already have (or will separately get) their own regression tests; this script's job is explanation, not verification |
+
+**Why B.** Consistency: everything else demoable in this project talks to the real running app over real HTTP, not an in-process shortcut. The cost — needing the server started with different env vars for this one demo — is small and handled by having the script print exactly what to run.
+
+**Demo 1 — concurrent duplicate lookup.** `POST /remove` the demo VIN first (clean starting state, makes repeat runs deterministic), then fire two `POST /lookup` calls for that same VIN together via `asyncio.gather`, timing each and printing its `cached` value. Because the initial cache-miss check is a sub-millisecond SQLite `SELECT` and vPIC is a real network call (100s of ms), both requests reliably pass the miss-check before either can finish writing — so both come back `cached: false`, both having independently called vPIC. A third, sequential lookup afterward returns `cached: true` as a bookend, showing this is specific to the concurrent-miss race, not a general problem.
+
+**Demo 2 — cache size cap.** The production default (`CACHE_MAX_ROWS=10000`) can't be practically demoed — sending 10,000+ distinct, vPIC-decodable VINs live is a load test, not a demo. The script expects the server to be started with a small value instead, and carries its own constant for the printed instructions:
+
+```python
+# In production, CACHE_MAX_ROWS should be set much larger than this — e.g.
+# 100_000, or whatever comfortably covers the number of distinct VINs
+# expected within one CACHE_TTL_SECONDS window. This value exists only so
+# the eviction behavior is visible after a handful of requests in a live
+# demo, not because it's a realistic production number.
+RECOMMENDED_DEMO_CACHE_MAX_ROWS = 3
+```
+
+The script sequentially looks up all 7 of the assignment's sample VINs, spaced 1.1s apart so each gets a distinct `cached_at` second (SQLite's `cached_at` is second-precision — without spacing, several rows could tie, making "oldest evicted first" ambiguous) — deliberately the known-good sample list, not synthetic fake VINs, because Phase 7's all-empty-fields check means an undecodable VIN is rejected (502) and never cached, which would starve this demo of anything to evict. It then waits a fixed window (`2 × CACHE_SWEEP_INTERVAL_SECONDS + 5s`) before checking `GET /export` (parsed with `pyarrow`, already a dependency), printing which VINs survived and which were evicted.
+
+That fixed-window wait replaced an earlier "declare success as soon as the row count first drops" approach, which manual testing against a live server showed was wrong: a sweep tick firing *while* the 7 lookups are still landing can evict early, then more rows land afterward, settling on a count that's lower but not fully converged to the cap (observed: 5 rows left instead of 3, because the tick fired mid-loop). Waiting a window that comfortably covers a full sweep interval *after* the last write finishes guarantees the final read reflects a clean tick over the fully-settled row set. If the count never drops at all within that window, it prints a hint pointing back at the required env vars rather than failing silently.
+
+**How to run it:**
+
+```bash
+CACHE_MAX_ROWS=3 CACHE_SWEEP_INTERVAL_SECONDS=5 uvicorn app.main:app --reload
+# in a second terminal:
+python scripts/demo_concurrency_and_cache_cap.py
+```
+
+No new dependency — `httpx` and `pyarrow` are already in `pyproject.toml`/`requirements.txt`. `DEMO_BASE_URL` (default `http://127.0.0.1:8000`) lets it point at a non-default host/port.
+
 ## Project layout
 
 - [`app/main.py`](../../app/main.py) — FastAPI app, lifespan (DB + httpx + `_cache_maintenance_loop` background task), include router, serve `GET /`
@@ -270,6 +312,7 @@ A small page at `GET /` ([`app/static/index.html`](../../app/static/index.html))
 - [`app/vpic.py`](../../app/vpic.py) — decode client; raises on transport failure *and* on an all-fields-empty decode
 - [`app/settings.py`](../../app/settings.py) — `CACHE_TTL_SECONDS` (default 604800), `CACHE_SWEEP_INTERVAL_SECONDS` (default 3600), `CACHE_MAX_ROWS` (default 10000), `DATABASE_PATH`, `VPIC_BASE_URL`, `VPIC_TIMEOUT_SECONDS`
 - [`tests/`](../../tests/) — validation, hit/miss, expiry-as-miss, undecodable-VIN, remove, export, WAL pragma, size cap, background sweep
+- [`scripts/demo_concurrency_and_cache_cap.py`](../../scripts/demo_concurrency_and_cache_cap.py) — narrated demo of concurrent duplicate lookups and cache size-cap eviction against a running server (Phase 8)
 - [`pyproject.toml`](../../pyproject.toml) — fastapi, uvicorn, httpx, sqlalchemy, aiosqlite, pyarrow, pytest; `pythonpath = ["."]` so bare `pytest` resolves `app`
 - [`requirements.txt`](../../requirements.txt) / [`requirements-dev.txt`](../../requirements-dev.txt) — pip install on a clean machine
 - [`README.md`](../../README.md) — run from a clean checkout; how to try sample VINs

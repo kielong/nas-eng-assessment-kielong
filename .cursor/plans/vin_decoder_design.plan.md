@@ -85,7 +85,17 @@ Response:
 
 **GET `/export`**
 
-Parquet attachment of live cache rows only. Columns: `vin`, `make`, `model`, `model_year`, `body_class`. No `cached`, no `cached_at`.
+Parquet attachment of live cache rows only. Columns: `vin`, `make`, `model`, `model_year`, `body_class`. No `cached`, no `cached_at`. Suggested filename is `vin_cache_<UTC timestamp>.parquet` (`_export_filename` in `app/routes.py`), not a fixed `vin_cache.parquet` — the original name, since every export suggests the identical name, meant repeat exports silently overwrote each other on disk (`curl -O -J` always overwrites; some browsers do too, depending on download settings).
+
+| Option | Tradeoff |
+|---|---|
+| A. Fixed `vin_cache.parquet` (original) | Simplest possible code | Every export collides with the last; no way to tell two downloads apart or know when either was taken |
+| B. UTC timestamp in the filename **(chosen)** | Sortable if you accumulate several (`YYYYMMDDTHHMMSSZ` sorts lexicographically = chronologically); tells you *when* an export was taken, not just that it's distinct; needs no state | Two exports within the same second still collide — second-precision, not a uniqueness guarantee |
+| C. A persistent counter/sequence number | Guaranteed-unique regardless of timing | Needs somewhere to persist the counter (a file, a DB row) across restarts — new state for a problem a timestamp already solves for any realistic human export cadence |
+| D. A random UUID | Guaranteed-unique, no shared state needed | Tells you nothing about *when* — a worse fit for "I exported this twice, which one is newer" than a timestamp |
+| E. A content hash of the exported rows | Two exports with unchanged data get the *same* filename, which is arguably a feature (no duplicate downloads of identical content) | Adds a hashing step for a benefit (dedup) nobody asked for; still collides if the content is unchanged but the reviewer wanted proof of *when* they checked |
+
+**Why B.** It directly answers "which export is this" (chronologically) with zero new state, unlike C or D, and unlike E it doesn't add a step to solve a problem (content dedup) that isn't the one being asked about. The colon in a standard ISO-8601 timestamp (`15:30:45`) is illegal in a Windows filename, so the format is `YYYYMMDDTHHMMSSZ` — compact, sortable, filesystem-safe everywhere — deliberately not a reuse of `db.utcnow_iso()`'s `+00:00`-suffixed style, which is fine for a SQL column but not for a filename. Same-second collisions are accepted as a known limit, not silently ignored: a human clicking "export" twice in under a second is not a real usage pattern this needs to defend against.
 
 Pydantic models in [`app/schemas.py`](../../app/schemas.py):
 
@@ -242,7 +252,7 @@ flowchart TD
 
 **Why B**, with a mitigation: the Phase 7 "all fields empty" rule (see "vPIC client") wasn't guessed — it was verified by hitting the live API by hand for both a real sample VIN and a garbage one, once, before writing the mocked test around that confirmed shape. The mocks encode a contract that was checked against the real thing, not assumed.
 
-50 tests across three files, not one. `tests/test_api.py` (24) is the HTTP-level suite through `TestClient` — request validation, lookup miss/hit/expiry, vPIC failure modes surfaced as 502s, remove hit/miss, export (empty, mixed live/expired, exact-TTL boundary), the demo page, the SQLite WAL/busy-timeout pragmas, size-cap eviction, and one integration test proving the background sweep purges an expired row and evicts over the row cap on its own with no `/lookup`/`/export` call, seeded before the app starts and polled after.
+53 tests across three files, not one. `tests/test_api.py` (27) is the HTTP-level suite through `TestClient` — request validation, lookup miss/hit/expiry, vPIC failure modes surfaced as 502s, remove hit/miss, export (empty, mixed live/expired, exact-TTL boundary, filename format, two exports a second apart getting different filenames), the demo page, the SQLite WAL/busy-timeout pragmas, size-cap eviction, and one integration test proving the background sweep purges an expired row and evicts over the row cap on its own with no `/lookup`/`/export` call, seeded before the app starts and polled after. `_export_filename` itself also gets a small direct unit test (exact string for a fixed timestamp) colocated in the same file, rather than a new `tests/test_routes.py` — one pure function doesn't earn its own file the way `vpic.py`'s and `settings.py`'s branching logic did (see below).
 
 `tests/test_vpic.py` (15) and `tests/test_settings.py` (11) are dedicated unit tests, added by a later code-quality pass. Both modules were only ever exercised *indirectly* before that — `decode_vin` through `/lookup` + `respx` mocking (which does run its real code, just by way of the full FastAPI+DB stack), and `get_settings()` incidentally, through whichever two of its six env vars a given HTTP-level test's fixture happened to set. That's not "untested," but it means an edge case in either module — `Results[0]` present but not a dict, a `CACHE_MAX_ROWS` of zero — could only be reached by routing through code that has nothing to do with it. The rule that emerged: a module gets its own direct unit-test file when it has real branching logic worth isolating (`vpic.py`'s error-mapping, `settings.py`'s validation); a thin pass-through (`schemas.py`'s validator, `routes.py`'s dependency getters) stays covered adequately through the HTTP-level tests that already exercise it. This is the answer to "should every component have its own unit tests" for this project: not uniformly, but wherever a module's own logic is complex enough that indirect coverage would hide failures rather than catch them.
 
@@ -267,6 +277,8 @@ A small page at `GET /` ([`app/static/index.html`](../../app/static/index.html))
 | B. A single static HTML file, vanilla JS `fetch` calls **(chosen)** | Zero build step, one file, readable top-to-bottom in a five-minute review |
 
 **Why B.** The backend is the deliverable being evaluated; the UI only needs to make it demoable without Postman, not showcase frontend engineering.
+
+When the export filename was changed server-side to include a timestamp (see the `GET /export` options table above), the export button here needed a matching fix: it originally hardcoded `link.download = "vin_cache.parquet"`, which would have quietly overridden the server's timestamped name for anyone using the browser demo instead of `curl`, defeating the fix for exactly the audience most likely to hit it (repeat clicks in a live walkthrough). It now reads the filename from the response's own `Content-Disposition` header instead, so there's one source of truth, not two places that have to agree.
 
 ## Demo script: concurrency and cache cap
 

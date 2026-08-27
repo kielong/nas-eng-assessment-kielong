@@ -87,12 +87,13 @@ Expired-then-vPIC-fails: we delete the stale row first, then call vPIC. A 502 le
 
 - [x] `POST /lookup` → live hit `{ ..., "cached": true }`; miss/expiry → vPIC → upsert → `{ ..., "cached": false }`; vPIC failure → 502
 - [x] `POST /remove` → `{ "vin", "deleted" }`, HTTP 200 either way
-- [x] `GET /export` → purge expired, parquet attachment `vin_cache.parquet` (`application/vnd.apache.parquet`)
+- [x] `GET /export` → purge expired, parquet attachment (`application/vnd.apache.parquet`)
+- [x] Attachment filename is `vin_cache_<UTC timestamp>.parquet` (`_export_filename`, e.g. `vin_cache_20260827T153045Z.parquet`), not a fixed `vin_cache.parquet` — repeat exports otherwise all suggest the same name and silently overwrite each other on disk (`curl -O -J` always overwrites; some browsers do too). Colon-free, sortable, deliberately its own format rather than reusing `db.utcnow_iso()`'s `+00:00`-suffixed style, since `:` is illegal in a Windows filename
 - [x] Empty / all-expired export is a valid empty table with the five string columns
 - [x] `/export`'s parquet table is built with a fixed `EXPORT_SCHEMA` and a single pass over the rows (`pa.Table.from_pylist`), not five separate column comprehensions over the same list
 - [x] App lifespan starts `_cache_maintenance_loop` (purge expired + enforce row cap) alongside the DB engine and httpx client, cancelled cleanly on shutdown; sweep failures are logged and retried next interval, never surfaced to a request
 
-**Done when.** Lookup miss then hit does not call vPIC twice. Export does not include `cached` or `cached_at`. Invalid VIN is 422.
+**Done when.** Lookup miss then hit does not call vPIC twice. Export does not include `cached` or `cached_at`. Invalid VIN is 422. Two exports a second or more apart get different suggested filenames.
 
 ---
 
@@ -118,6 +119,7 @@ Expired-then-vPIC-fails: we delete the stale row first, then call vPIC. A 502 le
 - [x] `tests/test_vpic.py`: `decode_vin`/`_field` tested directly against a mocked `httpx.AsyncClient` — every `VpicError` branch (HTTP error, timeout, invalid JSON, missing/empty/non-list `Results`, non-dict first result, all-fields-empty), plus the exact request shape (`format=json`, no `modelyear` param) and that a *partially* populated decode is still a success
 - [x] `tests/test_settings.py`: `get_settings()` defaults when nothing is set, every one of the 6 env vars overrides its field, and the new positive-value validation rejects `0` / negative / non-numeric input for each numeric setting
 - [x] Stray `import io` inside two test functions moved to the top-level import, matching every other import in the file
+- [x] `_export_filename` unit-tested directly: exact string for a known timestamp, no `:` or `+`; HTTP-level `TestExport` asserts the `Content-Disposition` header matches the `vin_cache_<UTC timestamp>.parquet` pattern, and that two exports a second apart get different filenames
 
 **Done when.** `pytest` is green offline.
 
@@ -153,10 +155,10 @@ Expired-then-vPIC-fails: we delete the stale row first, then call vPIC. A 502 le
 - [x] Clickable list of the assignment sample VINs that fills the field
 - [x] Lookup: show `make`, `model`, `model_year`, `body_class`, and whether it was cached
 - [x] Remove: show whether a row was deleted
-- [x] Export: download the parquet file
+- [x] Export: download the parquet file, using the server's own `Content-Disposition` filename (`filenameFromContentDisposition`) rather than a hardcoded `vin_cache.parquet` — added when the export filename was timestamped server-side, since the UI's hardcoded name would otherwise have silently defeated that fix for anyone using the browser demo instead of curl
 - [x] Surface 422 / 502 in the page so a bad VIN or a vPIC outage is visible in the demo
 
-**Done when.** With the server running, a reviewer can exercise lookup (miss then hit), remove, and export from a browser.
+**Done when.** With the server running, a reviewer can exercise lookup (miss then hit), remove, and export from a browser. The downloaded file's name matches what `/export` actually sent, not a value baked into the page.
 
 **Out of scope for this phase.** SPA framework, login, editing cached fields, TTL admin UI.
 

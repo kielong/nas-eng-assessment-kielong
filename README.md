@@ -145,7 +145,7 @@ curl -s -X POST http://127.0.0.1:8000/remove \
 curl -s -O -J http://127.0.0.1:8000/export
 ```
 
-Downloads `vin_cache.parquet` with columns `vin`, `make`, `model`, `model_year`, `body_class`. Expired rows are purged first.
+Downloads `vin_cache_<UTC timestamp>.parquet` (e.g. `vin_cache_20260827T153045Z.parquet`) with columns `vin`, `make`, `model`, `model_year`, `body_class`. Expired rows are purged first. Each export gets its own filename so repeat downloads don't overwrite each other.
 
 ## Sample VINs
 

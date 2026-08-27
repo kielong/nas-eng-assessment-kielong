@@ -334,6 +334,12 @@
       }
     }
 
+    function filenameFromContentDisposition(response, fallback) {
+      const header = response.headers.get("Content-Disposition") || "";
+      const match = header.match(/filename="([^"]+)"/);
+      return match ? match[1] : fallback;
+    }
+
     async function onExport() {
       exportBtn.disabled = true;
       try {
@@ -343,16 +349,20 @@
           showError(response.status, payload);
           return;
         }
+        // Read the filename from the server's own header instead of hardcoding
+        // it here -- the server timestamps it so repeat exports don't collide,
+        // and that logic should live in one place, not be duplicated in JS.
+        const filename = filenameFromContentDisposition(response, "vin_cache.parquet");
         const blob = await response.blob();
         const url = URL.createObjectURL(blob);
         const link = document.createElement("a");
         link.href = url;
-        link.download = "vin_cache.parquet";
+        link.download = filename;
         link.click();
         URL.revokeObjectURL(url);
         result.innerHTML =
           `<span class="status ok">Downloaded</span>` +
-          `<p class="message">vin_cache.parquet (live cache rows only).</p>`;
+          `<p class="message">${escapeHtml(filename)} (live cache rows only).</p>`;
       } catch (err) {
         showError("network", { detail: err.message });
       } finally {

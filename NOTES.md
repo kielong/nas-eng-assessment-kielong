@@ -1,58 +1,44 @@
 # Notes
 
-## Schema design
+## What I built
 
-One schema, three representations. JSON responses, the SQLite table, and the parquet export all use the same field names — `vin`, `make`, `model`, `model_year`, `body_class` — instead of a different vocabulary per format. `cached` is computed at request time and never stored. `cached_at` exists purely for the cache's own bookkeeping and is dropped from every external representation. Missing vPIC values are stored as empty strings, not NULL, so every representation stays uniformly typed — no format-specific null-handling to write or test.
+A FastAPI service with three routes: `POST /lookup` (SQLite first, vPIC on a miss, then store), `POST /remove`, and `GET /export` (parquet of live cache rows, filename stamped with a UTC timestamp so repeat exports don't overwrite each other on disk). Lookup and remove take `{"vin": "..."}` so a vehicle identifier is not a query string that would land in access logs and browser history. Export takes nothing.
 
-## Cache and TTL
+This is a cache, not a vehicle warehouse. JSON, SQLite, and parquet share one vocabulary — `vin`, `make`, `model`, `model_year`, `body_class` — so there is one schema to keep honest instead of translating display labels (`"Input VIN Requested"`, `"Cached Result?"`) on every boundary. `cached` answers "did this request hit SQLite?"; that is request-scoped, so it is never stored. `cached_at` exists only so the cache can expire and evict, so it is never exported. Missing vPIC values are empty strings, not NULL, so every representation stays the same type.
 
-Two mechanisms, not one:
+VINs are 17 alphanumeric characters, uppercased before they become a cache key, because mixed-case would split the cache. I do not also enforce a check digit or ban `I`/`O`/`Q` — whether a VIN is *real* is vPIC's call, and two independent validity rules would eventually disagree. Invalid VIN is 422 (the request is wrong). vPIC failure is 502 and nothing is written (the upstream is wrong; fail closed so a garbage decode cannot sit in the cache). A remove miss is 200 with `deleted: false`, because that boolean is the result, not an HTTP 404.
 
-- **Reactive, per-VIN cleanup.** `/lookup` deletes an expired row for that VIN before re-fetching. `/remove` deletes unconditionally. `/export` sweeps every expired row before dumping the rest.
-- **Active, periodic maintenance.** A background `asyncio` task, started and cancelled in the same app lifespan that owns the DB engine and httpx client, runs once immediately at startup and then every `CACHE_SWEEP_INTERVAL_SECONDS` (default 1 hour). Each tick purges every expired row and evicts the oldest rows by `cached_at` if the table exceeds `CACHE_MAX_ROWS` (default 10,000).
+I call vPIC `DecodeVinValues` because it returns a flat `Results[0]` I can map 1:1 onto those four fields. I discard the rest of the payload so the table and the parquet file stay the same shape as the API. vPIC returns HTTP 200 even for a well-formed but undecodable VIN (blank make/model/year/body class); I treat that as a 502 rather than caching empties.
 
-The reactive path alone leaves two gaps: a VIN looked up once and never revisited sits past its TTL until something happens to touch it, and TTL bounds *staleness*, not *size* — a burst of lookups for distinct VINs within one TTL window can still grow the table with no ceiling. The periodic task closes both on the same timer, without adding a scheduler process — it's an `asyncio` task inside the existing app, not new infrastructure.
+Entries expire after 7 days. VIN attributes almost never change, so the TTL is a bound on a bad cache entry, not a freshness strategy. `/lookup` deletes an expired row for that VIN before re-fetching, so a miss always means it is safe to write a fresh row. That reactive path is not enough on its own: a VIN looked up once and never revisited sits past TTL, and TTL does not cap how many distinct VINs arrive in one window.
 
-## vPIC
+This is a cache, so it needs a ceiling. A database is allowed to grow with the business; a cache that can grow without bound is just an unbounded table that `/export` loads into memory. An `asyncio` task in the same lifespan as the DB engine and httpx client closes both gaps — purge expired, then if the table is still over 10,000 rows, delete the oldest by `cached_at` — without a scheduler process. Oldest-first is the right eviction here because a cache hit does not refresh `cached_at` (the decode does not get more correct by being read). The entries that have sat the longest are also the closest to TTL. 10,000 is large enough that a normal run never hits it, and small enough that the SQLite file and an in-memory parquet export stay cheap. In production I would set the cap to expected distinct VINs in one TTL window, not to a magic number. The cap is enforced on that timer, not on every write, so `/lookup` stays get-or-upsert.
 
-`DecodeVinValues` is the endpoint because it returns a flat object; I keep only the four fields the assignment asks for and discard the rest.
-
-- HTTP errors, timeouts, and empty `Results` are a **502**. Nothing is written.
-- An expired row is deleted *before* calling vPIC, not after — a subsequent 502 leaves that VIN uncached rather than serving a stale decode.
-- vPIC returns HTTP **200** even for a well-formed but undecodable VIN — it just leaves every mapped field blank. I confirmed this directly against the live API rather than assuming it: `AAAAAAAAAAAAAAAAA` comes back 200 with `Make`/`Model`/`ModelYear`/`BodyClass` all empty and `ErrorCode: "1,7,400"`; a real sample VIN comes back with those fields populated and `ErrorCode: "0"`. I treat an all-four-empty decode as a failure — 502, nothing cached — using that verified signal instead of parsing vPIC's own `ErrorCode`, a comma-separated, semi-documented taxonomy I couldn't fully confirm.
-
-## Concurrency
-
-SQLite connections set `PRAGMA journal_mode=WAL` and `PRAGMA busy_timeout=5000` on connect. Without it, two overlapping writes from a single process — two browser tabs hitting `/lookup` at once, say — raise `database is locked` instead of one simply waiting. This only helps within one process; it doesn't make SQLite safe across multiple app replicas (see Production).
-
-I deliberately did not add a per-VIN lock to collapse concurrent duplicate vPIC calls. Two simultaneous first-lookups of the same VIN each miss and each call vPIC — wasteful, not incorrect, since the second write just overwrites the first with identical data. An `asyncio.Lock` keyed by VIN would fix that, but a lock table keyed by every VIN ever looked up grows without bound for the life of the process — a tradeoff of its own that I didn't want to take on silently.
+`GET /` is a static page over the same three routes so a walkthrough does not need Postman. It adds no API and no columns. OpenAPI is unchanged.
 
 ## Tradeoffs
 
-These are the decisions where I had real latitude — not the ones the assignment already made for me (three routes, SQLite, 17-alphanumeric VINs).
+Decisions I had latitude on — not the ones that were already fixed (three routes, SQLite, 17-alphanumeric VINs).
 
 | Decision | Why I chose it | What it costs |
 |---|---|---|
-| Delete an expired row before calling vPIC, not after | Never serve a stale decode | A vPIC outage right after expiry drops the last-known-good value instead of degrading gracefully — I chose correctness over availability |
-| One periodic task enforces both TTL and the row cap, on an interval — not instantly on every write | Reuses a single timer for both concerns instead of adding cap-checking to the hot `/lookup` write path | Between ticks, the table can transiently exceed `CACHE_MAX_ROWS` — bounded by how many distinct VINs get written in one interval, not unbounded |
-| No per-VIN lock on cache-miss | Simpler code, no lock-table lifecycle to reason about, at demo scale | Concurrent first-lookups of the same VIN double-call vPIC (thundering herd) — I'd add one before this saw real traffic |
-| Treat an all-fields-empty vPIC decode as a failure, not vPIC's `ErrorCode` | A signal I could verify directly against the live API, not a taxonomy I'd be trusting blindly | Narrower than `ErrorCode` — a decode with *some* fields populated but a bad check digit still caches |
-| SQLite in WAL mode + a busy timeout | Removes a `database is locked` failure I could reproduce, not a hypothetical one | Still one file, one writer at a time — doesn't help across multiple replicas |
-| `purge_expired` compares `cached_at` as a plain string in SQL (`WHERE cached_at <= cutoff`), not by parsing every row into a `datetime` in Python | One `DELETE` instead of fetching the whole table on every hourly tick — `enforce_size_cap` already trusted this same property for its `ORDER BY`, so this just makes the two consistent | Only correct because this module is the sole writer of `cached_at` and always formats it the same way; a hand-edited row in a different format would silently sort wrong |
-| SQLAlchemy async ORM over raw `aiosqlite` calls | One declarative model instead of hand-written DDL and row-mapping; the async session machinery I needed anyway for concurrent requests | Heavier dependency and more indirection than raw SQL for what's ultimately one table |
-| `GET /export` purges expired rows as a side effect | Export should reflect the live cache; reusing the existing expiry predicate keeps parquet and lookup semantics identical | Technically breaks HTTP's "GET is safe" contract — acceptable because nothing like a caching proxy sits in front of this API today |
-| One shared field-name vocabulary across JSON, SQL, and parquet, instead of mirroring the assignment's display labels | No per-format translation layer to keep in sync or test separately | A reviewer has to map "Cached Result?" to `cached` once — a small, one-time cost for a permanently smaller schema surface |
-| `POST` with a JSON body for lookup/remove, not `GET ?vin=` | Keeps a per-vehicle identifier out of URLs — no VIN in server access logs or browser history | Less convenient than a bare, pasteable URL — worked around with the demo page |
-| Validation enforces only "17 alphanumeric," not real-VIN rules (no check digit, `I`/`O`/`Q` accepted) | One source of truth for whether a VIN is *real*: vPIC. I didn't want the request validator and the vPIC client independently deciding VIN validity and risking disagreement | A syntactically valid but nonsense VIN still round-trips to vPIC before the all-empty-fields check catches it |
-| Cache only the four decode fields, not the raw vPIC payload | Small table; parquet export matches the API 1:1 with no extra mapping | Can't debug a bad decode from the original vPIC response — only from what was chosen to keep |
-
-## Demo UI
-
-`GET /` serves a single static page that calls the three existing routes. No extra API, no extra columns. It exists so a walkthrough does not need Postman or curl. OpenAPI (`/docs`) is unchanged.
+| Snake_case JSON (`vin`, `cached`, `deleted`) instead of display labels (`"Input VIN Requested"`, `"Cached Result?"`, `"Cache Delete Success?"`) | One vocabulary across JSON, SQL, and parquet — no per-format translation layer to keep in sync | A reviewer maps the labels to keys once |
+| `POST` with a JSON body for lookup/remove, not `GET ?vin=` | A VIN in a query string lands in access logs and browser history | Less convenient than a pasteable URL — the demo page covers that |
+| Validation is "17 alphanumeric" only — no check digit, `I`/`O`/`Q` accepted | Whether a VIN is *real* is vPIC's job. I didn't want the request validator and the client independently deciding validity and disagreeing | A nonsense-but-well-formed VIN still round-trips to vPIC |
+| Cache only the four decode fields, not the raw vPIC payload | Small table; parquet matches the API 1:1 | Can't debug a bad decode from the original vPIC blob |
+| Delete an expired row before calling vPIC, not after | Never serve a stale decode | A vPIC outage right after expiry drops last-known-good — correctness over availability |
+| All-four-fields-empty decode is a 502, not vPIC's `ErrorCode` | vPIC returns HTTP 200 for garbage VINs with every mapped field blank. Confirmed live: `AAAAAAAAAAAAAAAAA` → 200, `ErrorCode: "1,7,400"`, all four empty. A signal I could verify, not a comma-separated taxonomy I couldn't fully confirm | Narrower than `ErrorCode` — a decode with *some* fields populated but a bad check digit still caches |
+| Hard cap of 10,000 rows; oldest `cached_at` evicted first | This is a cache, not a database. TTL bounds how stale a row can be, not how many rows exist — a burst of distinct VINs in one window would otherwise grow forever, and `/export` already loads the live table into memory. 10,000 is generous for a modest cache and cheap to export; oldest-first matches a hit path that does not bump `cached_at` | A hot VIN cached early can still be evicted before a cold VIN cached later. Production would size the cap to expected distinct VINs in one TTL window |
+| Cap and TTL enforced on a timer, not on every `/lookup` write | One in-process task for both concerns; the hot path stays get-or-upsert | The table can transiently exceed 10,000 rows between ticks — bounded by one interval of distinct VINs, not unbounded |
+| No per-VIN lock on cache-miss | Duplicate vPIC on concurrent first-miss is wasteful, not incorrect (second write overwrites the first with the same data). A lock table keyed by every VIN grows for the life of the process | Thundering herd on the first concurrent miss — I'd add single-flight before real traffic |
+| SQLite WAL + `busy_timeout=5000` | Fixes a `database is locked` failure I could reproduce in one process (two overlapping writes) | Still one file, one writer at a time — does not help across replicas |
+| SQLAlchemy 2 async over raw `aiosqlite` | Needed async session lifecycle for concurrent requests anyway; one declarative model is the Postgres migration path | Heavier than raw SQL for a single table |
+| `GET /export` purges expired rows as a side effect | Export should match lookup's idea of "live"; same expiry predicate | Breaks HTTP's "GET is safe" contract — fine with no caching proxy in front of this API |
+| Export filename is `vin_cache_<UTC timestamp>.parquet`, not fixed | A fixed name meant every export collided and silently overwrote the last on disk (`curl -O -J` always overwrites) | Second-precision — two exports inside the same second still collide, and I'm fine with that, not chasing microsecond uniqueness for a human clicking "export" |
 
 ## Production
 
-This would run as a container with the SQLite file on a volume. SQLite is fine for a single instance and a modest cache.
+I'd run one container, one uvicorn worker, SQLite on a volume. There is no Dockerfile in the repo; the image would be `python:3.11-slim` plus uvicorn. Multiple workers on the same SQLite file is the line where I'd move to Postgres, not add more SQLite cleverness. SQLite is fine for a single instance and a modest cache.
 
 ### If this had to handle real traffic
 

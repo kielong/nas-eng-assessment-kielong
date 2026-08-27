@@ -1,4 +1,5 @@
 import io
+import re
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
@@ -19,6 +20,7 @@ from app.db import (
     purge_expired,
 )
 from app.main import create_app
+from app.routes import _export_filename
 
 SAMPLE_VIN = "1HGCM82633A004352"
 SAMPLE_VIN_LOWER = "1hgcm82633a004352"
@@ -239,16 +241,29 @@ class TestRemove:
         assert missing.json() == {"vin": SAMPLE_VIN, "deleted": False}
 
 
+EXPORT_FILENAME_PATTERN = re.compile(r'filename="vin_cache_\d{8}T\d{6}Z\.parquet"')
+
+
 class TestExport:
     def test_empty_cache_returns_empty_parquet(self, client):
         response = client.get("/export")
         assert response.status_code == 200
         assert response.headers["content-type"] == "application/vnd.apache.parquet"
-        assert "vin_cache.parquet" in response.headers["content-disposition"]
+        assert EXPORT_FILENAME_PATTERN.search(response.headers["content-disposition"])
 
         table = pq.read_table(io.BytesIO(response.content))
         assert table.column_names == ["vin", "make", "model", "model_year", "body_class"]
         assert table.num_rows == 0
+
+    def test_repeated_exports_get_different_filenames(self, client):
+        # The whole point of the timestamp: two exports a second apart must
+        # not suggest the same filename and silently overwrite on disk.
+        first = client.get("/export").headers["content-disposition"]
+        time.sleep(1.1)
+        second = client.get("/export").headers["content-disposition"]
+        assert first != second
+        assert EXPORT_FILENAME_PATTERN.search(first)
+        assert EXPORT_FILENAME_PATTERN.search(second)
 
     @respx.mock
     def test_export_contains_live_rows_and_drops_expired(self, client, db_path):
@@ -276,6 +291,20 @@ class TestExport:
         table = pq.read_table(io.BytesIO(response.content))
         assert table.column("vin").to_pylist() == []
         assert vins_in_db(db_path) == set()
+
+
+class TestExportFilename:
+    def test_exact_format_for_a_known_timestamp(self):
+        now = datetime(2026, 8, 27, 15, 30, 45, tzinfo=timezone.utc)
+        assert _export_filename(now=now) == "vin_cache_20260827T153045Z.parquet"
+
+    def test_no_colons_or_plus_signs(self):
+        # ":" is illegal in a Windows filename; "+" (the db.utcnow_iso style
+        # offset) is legal but ugly in a suggested download name. This is
+        # deliberately its own format, not a reuse of db.utcnow_iso().
+        name = _export_filename(now=datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc))
+        assert ":" not in name
+        assert "+" not in name
 
 
 class TestDemoUi:

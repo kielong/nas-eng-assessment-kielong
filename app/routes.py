@@ -1,5 +1,6 @@
 import io
 from collections.abc import AsyncIterator
+from datetime import datetime, timezone
 
 import httpx
 import pyarrow as pa
@@ -36,6 +37,16 @@ def get_http_client(request: Request) -> httpx.AsyncClient:
 
 def get_app_settings(request: Request) -> Settings:
     return request.app.state.settings
+
+
+def _export_filename(now: datetime | None = None) -> str:
+    # Colon-free, sortable UTC timestamp: repeat exports otherwise all
+    # suggest "vin_cache.parquet" and silently overwrite each other on disk
+    # (curl -O -J always overwrites; some browsers do too). Not colon-safe
+    # ISO-8601 (":" is illegal in a Windows filename) -- deliberately a
+    # separate, filename-specific format from db.utcnow_iso().
+    now = now or datetime.now(timezone.utc)
+    return f"vin_cache_{now.strftime('%Y%m%dT%H%M%SZ')}.parquet"
 
 
 def _lookup_response(row: db.VinCache, *, cached: bool) -> LookupResponse:
@@ -110,5 +121,5 @@ async def export_cache(
     return Response(
         content=buf.getvalue(),
         media_type="application/vnd.apache.parquet",
-        headers={"Content-Disposition": 'attachment; filename="vin_cache.parquet"'},
+        headers={"Content-Disposition": f'attachment; filename="{_export_filename()}"'},
     )
